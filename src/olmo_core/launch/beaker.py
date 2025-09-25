@@ -3,44 +3,21 @@ Launch experiments on `Beaker <https://beaker.org>`_.
 """
 
 import argparse
-import hashlib
 import logging
 import os
 import sys
-import tempfile
 import textwrap
-import time
 from dataclasses import dataclass, field
-from datetime import timedelta
-from pathlib import Path
-from typing import List, Literal, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
-import requests
+import gantry
 import rich
-from beaker import (
-    Beaker,
-    Dataset,
-    DatasetConflict,
-    DatasetNotFound,
-    Experiment,
-    ExperimentSpec,
-    ImageNotFound,
-    Job,
-    Priority,
-    RetrySpec,
-    TaskResources,
-    TaskSpec,
-)
-from rich.prompt import Confirm
+from beaker import Beaker, BeakerWorkload
+from beaker.exceptions import BeakerImageNotFound
 
 from ..config import Config, StrEnum
 from ..distributed.utils import OLMO_SHARED_FS_ENV_VAR
-from ..exceptions import (
-    BeakerExperimentFailedError,
-    OLMoConfigurationError,
-    OLMoEnvironmentError,
-)
-from ..train.callbacks.beaker import BEAKER_RESULT_DIR
+from ..exceptions import OLMoConfigurationError, OLMoEnvironmentError
 from ..utils import (
     LOG_FILTER_TYPE_ENV_VAR,
     LogFilterType,
@@ -49,7 +26,6 @@ from ..utils import (
 )
 from ..version import VERSION
 from .select_beaker_hosts import get_beaker_hostname_constraints
-from .utils import GIT_BRANCH_ENV_VAR, GIT_REF_ENV_VAR, GIT_REPO_URL_ENV_VAR, GitConfig
 
 log = logging.getLogger(__name__)
 
@@ -57,14 +33,8 @@ log = logging.getLogger(__name__)
 __all__ = [
     "OLMoCoreBeakerImage",
     "BeakerLaunchConfig",
-    "BeakerEnvVar",
-    "BeakerEnvSecret",
-    "BeakerWekaBucket",
-    "BeakerPriority",
 ]
 
-
-BeakerPriority = Priority
 
 _DEFAULT_TORCH = "2.7.1".replace(".", "")
 _DEFAULT_CUDA = "12.8".replace(".", "")
@@ -112,38 +82,6 @@ class OLMoCoreBeakerImage(StrEnum):
     """
 
 
-@dataclass
-class BeakerEnvVar(Config):
-    name: str
-    value: str
-
-
-@dataclass
-class BeakerEnvSecret(Config):
-    name: str
-    secret: str
-
-
-@dataclass
-class BeakerWekaBucket(Config):
-    bucket: str
-    mount: str
-
-
-DEFAULT_SETUP_STEPS = (
-    f'if [[ -z "${GIT_BRANCH_ENV_VAR}" ]]; then',
-    f'  git clone "${GIT_REPO_URL_ENV_VAR}" .',
-    "else",
-    f'  git clone -b "${GIT_BRANCH_ENV_VAR}" --single-branch "${GIT_REPO_URL_ENV_VAR}" .',
-    "fi",
-    f'git checkout "${GIT_REF_ENV_VAR}"',
-    "git submodule update --init --recursive",
-    "conda shell.bash activate base",
-    "pip install -e '.[all]'",
-    "pip freeze",
-)
-
-
 def is_running_in_beaker() -> bool:
     """
     Check if the current process is running inside of a Beaker job (batch or session).
@@ -177,6 +115,11 @@ class BeakerLaunchConfig(Config):
     The command to run in the container.
     """
 
+    torchrun: bool = True
+    """
+    Run the command with ``torchrun``.
+    """
+
     budget: Optional[str] = None
     """
     The budget group to assign.
@@ -195,12 +138,6 @@ class BeakerLaunchConfig(Config):
     description: Optional[str] = None
     """
     A description for the experiment.
-    """
-
-    setup_steps: List[str] = field(default_factory=lambda: list(DEFAULT_SETUP_STEPS))
-    """
-    A list of shell commands to run for cloning your repo, installing dependencies,
-    and other arbitrary setup steps.
     """
 
     beaker_image: str = OLMoCoreBeakerImage.stable
@@ -225,9 +162,9 @@ class BeakerLaunchConfig(Config):
     The amount of shared memory to use.
     """
 
-    clusters: List[str] = field(default_factory=lambda: ["ai2/jupiter"])
+    cluster: str = "ai2/jupiter"
     """
-    The allowed clusters to run on.
+    The cluster to run on.
     """
 
     shared_filesystem: bool = False
@@ -236,7 +173,7 @@ class BeakerLaunchConfig(Config):
     shared filesystem (like weka or NFS).
     """
 
-    priority: Priority = Priority.normal
+    priority: str = "normal"
     """
     The job priority.
     """
@@ -251,12 +188,12 @@ class BeakerLaunchConfig(Config):
     The number of times to retry the experiment if it fails.
     """
 
-    env_vars: List[BeakerEnvVar] = field(default_factory=list)
+    env_vars: List[Tuple[str, str]] = field(default_factory=list)
     """
     Additional env vars to include.
     """
 
-    env_secrets: List[BeakerEnvSecret] = field(default_factory=list)
+    env_secrets: List[Tuple[str, str]] = field(default_factory=list)
     """
     Environment variables to add from secrets.
     """
@@ -266,7 +203,7 @@ class BeakerLaunchConfig(Config):
     Attach the NFS drive.
     """
 
-    weka_buckets: List[BeakerWekaBucket] = field(default_factory=list)
+    weka_buckets: List[Tuple[str, str]] = field(default_factory=list)
     """
     Weka buckets to attach and where to attach them.
     """
@@ -276,17 +213,10 @@ class BeakerLaunchConfig(Config):
     Allow running with uncommitted changed.
     """
 
-    host_networking: Optional[bool] = None
-
-    git: Optional[GitConfig] = field(default_factory=GitConfig.from_env)
+    git: Optional[gantry.api.GitRepoState] = field(default_factory=gantry.api.GitRepoState.from_env)
     """
     Git configuration, specifies where to clone your source code from and which commit to check out.
     If not set, this will be initialized automatically from your working directory.
-    """
-
-    result_dir: str = BEAKER_RESULT_DIR
-    """
-    The directory of the Beaker results dataset.
     """
 
     use_hostname_constraints: bool = False
@@ -331,244 +261,117 @@ class BeakerLaunchConfig(Config):
             env_vars.append((OLMO_SHARED_FS_ENV_VAR, "1"))
         return env_vars
 
-    @property
-    def beaker(self) -> Beaker:
-        """
-        The Beaker client.
-        """
-        if self._beaker is None:
-            kwargs = {}
-            if self.workspace:
-                kwargs["default_workspace"] = self.workspace
-            self._beaker = Beaker.from_env(**kwargs)
-        return self._beaker
-
     def _get_env_vars(self) -> List[Tuple[str, str]]:
         env_vars: List[Tuple[str, str]] = []
         env_var_names: Set[str] = set()
-        for var in self.env_vars:
-            env_vars.append((var.name, var.value))
-            env_var_names.add(var.name)
+        for name, value in self.env_vars:
+            env_vars.append((name, value))
+            env_var_names.add(name)
         for name, val in self.default_env_vars:
             if name not in env_var_names:
                 env_vars.append((name, val))
         return env_vars
 
-    def _get_torchrun_cmd(self) -> List[str]:
-        assert self.num_nodes >= 1
+    def build_recipe(self) -> gantry.api.Recipe:
+        with Beaker.from_env() as beaker:
+            cluster = beaker.cluster.get(self.cluster)
 
-        torchrun: List[str]
-        if self.num_nodes == 1:
-            torchrun = ["torchrun", f"--nproc-per-node={self.num_gpus}"]
-        else:
-            torchrun = [
-                "torchrun",
-                f"--nnodes={self.num_nodes}:{self.num_nodes}",
-                f"--nproc-per-node={self.num_gpus}",
-                "--rdzv_id=12347",
-                "--rdzv_backend=static",
-                '--rdzv_endpoint="${BEAKER_LEADER_REPLICA_HOSTNAME}:29400"',
-                '--node_rank="${BEAKER_REPLICA_RANK}"',
-                "--rdzv_conf='read_timeout=420'",
-            ]
-
-        return torchrun
-
-    def _create_script_dataset(self, script_name: str, script: List[str]) -> Dataset:
-        workspace_id = self.beaker.workspace.get(self.workspace).id
-
-        # Hash contents.
-        sha256_hash = hashlib.sha256()
-        for line in script:
-            sha256_hash.update(line.encode())
-
-        # Create unique name for dataset.
-        dataset_name = f"olmo-core-v{VERSION}-{workspace_id}-{sha256_hash.hexdigest()[:6]}"
-
-        dataset: Dataset
-        try:
-            dataset = self.beaker.dataset.get(dataset_name)
-        except DatasetNotFound:
-            # Create it.
-            log.info(f"Creating script dataset '{dataset_name}'...")
-            try:
-                with tempfile.TemporaryDirectory() as tmpdirname:
-                    tmpdir = Path(tmpdirname)
-                    script_path = tmpdir / script_name
-                    with open(script_path, "w") as script_file:
-                        for line in script:
-                            script_file.write(line + "\n")
-                    dataset = self.beaker.dataset.create(dataset_name, script_path)
-            except DatasetConflict:  # could be in a race with another process.
-                time.sleep(1.0)
-                dataset = self.beaker.dataset.get(dataset_name)
-
-        return dataset
-
-    def _resolve_beaker_image(self) -> str:
-        image = self.beaker_image
-        try:
-            return self.beaker.image.get(image).id
-        except ImageNotFound as exc:
-            # Image name was already a full name, so it probably doesn't exist.
-            if "/" in image:
-                raise
-
-            # Try pre-pending 'petew', since that's the account that we usually build the images from.
-            try:
-                return self.beaker.image.get(f"petew/{image}").id
-            except ImageNotFound:
-                raise exc
-
-    def build_experiment_spec(
-        self, torchrun: Optional[bool] = None, entrypoint: Optional[str] = None
-    ) -> ExperimentSpec:
-        """
-        Get the Beaker experiment spec corresponding to this config instance.
-        """
-        if torchrun is None:
-            if "torchrun" in self.cmd:
-                torchrun = False
+            if self.torchrun:
+                recipe = gantry.api.Recipe.multi_node_torchrun(
+                    self.cmd, gpus_per_node=self.num_gpus, num_nodes=self.num_nodes
+                )
             else:
-                torchrun = self.num_gpus > 1
+                recipe = gantry.api.Recipe(self.cmd)
+                recipe.gpus = self.num_gpus
+                if self.num_nodes > 1:
+                    recipe = recipe.with_replicas(self.num_nodes)
 
-        if self.git is None:
-            raise OLMoConfigurationError(
-                f"{self.__class__.__name__}.git field is required!\n"
-                "You either need to instantiate your launch config from a valid git repository folder or set the 'git' field manually."
-            )
+            recipe.name = self.name
+            recipe.task_name = self.task_name
+            recipe.description = self.description
+            recipe.budget = self.budget
+            recipe.workspace = self.workspace
+            recipe.priority = self.priority
+            recipe.preemptible = self.preemptible
+            recipe.shared_memory = self.shared_memory
+            recipe.allow_dirty = self.allow_dirty
+            recipe.clusters = [self.cluster]
+            recipe.retries = self.retries
+            recipe.env_vars = self._get_env_vars()
+            recipe.env_secrets = [(n, s) for n, s in self.env_secrets]
+            if self.git is not None:
+                recipe.ref = self.git.ref
+                recipe.branch = self.git.branch
 
-        if self.git.is_dirty and not self.allow_dirty:
-            raise RuntimeError(
-                "You have uncommitted changes! Set 'allow_dirty=True' in your launch config to force."
-            )
+            # Resolve beaker image.
+            image = self.beaker_image
+            try:
+                image = beaker.image.get(image).id
+            except BeakerImageNotFound as exc:
+                # Image name was already a full name, so it probably doesn't exist.
+                if "/" in image:
+                    raise
 
-        if not self.git.is_public and self.setup_steps == DEFAULT_SETUP_STEPS:
-            raise OLMoConfigurationError(
-                "It looks like your repository is private and private repositories will require "
-                "custom 'setup_steps' in order to clone the repo."
-            )
+                # Try pre-pending 'petew', since that's the account that we usually build the images from.
+                try:
+                    image = beaker.image.get(f"petew/{image}").id
+                except BeakerImageNotFound:
+                    raise exc
+            recipe.beaker_image = image
 
-        entrypoint_script = [
-            "#!/usr/bin/env bash",
-            "set -exo pipefail",
-            "[[ -d /var/lib/tcpxo/lib64 ]] && export LD_LIBRARY_PATH=/var/lib/tcpxo/lib64:$LD_LIBRARY_PATH",
-            # Setup the kernel cache directory used by pytorch
-            "mkdir -p /root/.cache/torch/kernels && export PYTORCH_KERNEL_CACHE_PATH=/root/.cache/torch/kernels",
-            "mkdir -p /olmo-core-runtime",
-            "cd /olmo-core-runtime",
-        ] + self.setup_steps
-
-        if torchrun:
-            if self.num_nodes > 1 and any(["augusta" in cluster for cluster in self.clusters]):
-                entrypoint_script.append(
-                    "BEAKER_REPLICA_RANK=$("
-                    "python -m olmo_core.launch.reorder_ranks_in_gcp "
-                    "--verbose "
-                    "${BEAKER_REPLICA_RANK} "
-                    "${BEAKER_REPLICA_COUNT} "
-                    "${BEAKER_LEADER_REPLICA_HOSTNAME}"
-                    ")"
-                )
-                entrypoint_script.append("export BEAKER_REPLICA_RANK=$BEAKER_REPLICA_RANK")
-            entrypoint_script.append(" ".join(self._get_torchrun_cmd()) + ' "$@"')
-        elif entrypoint:
-            entrypoint_script.append(f'{entrypoint} "$@"')
-        elif self.cmd and os.path.isfile(self.cmd[0]) and self.cmd[0].endswith(".py"):
-            entrypoint_script.append('python "$@"')
-        else:
-            entrypoint_script.append('exec "$@"')
-
-        entrypoint_dataset = self._create_script_dataset("entrypoint.sh", entrypoint_script)
-
-        if (
-            self.use_hostname_constraints
-            and len(self.clusters) == 1
-            and "augusta" in self.clusters[0]
-        ):
-            if self.retries is not None and self.retries > 0:
-                raise OLMoConfigurationError(
-                    "Hostname constraints cannot be used for beaker jobs with retries, since constraints do not update on retry."
-                )
-
-            host_name_constraints = get_beaker_hostname_constraints(
-                self.num_nodes,
-                self.num_execution_units or max(1, self.num_nodes // 32),
-                1,
-                "us-central1-b",
-                beaker_cluster=self.clusters[0],
-                beaker_priority=self.priority,
-            )
-            assert (
-                len(host_name_constraints) == 1 and len(host_name_constraints[0]) >= self.num_nodes
-            )
-            constraints_kwargs = {"hostname": host_name_constraints[0]}
-        else:
-            constraints_kwargs = {"cluster": self.clusters}
-
-        task_spec = (
-            TaskSpec.new(
-                self.task_name,
-                beaker_image=self._resolve_beaker_image(),
-                priority=self.priority,
-                preemptible=self.preemptible,
-                arguments=self.cmd,
-                command=["bash", "/olmo-core/entrypoint.sh"],
-                replicas=self.num_nodes if self.num_nodes > 1 else None,
-                leader_selection=self.num_nodes > 1,
-                host_networking=(
-                    self.host_networking
-                    if self.host_networking is not None
-                    else (
-                        self.num_nodes > 1
-                        or any(["augusta" in cluster for cluster in self.clusters])
+            if self.nfs:
+                if "storage:nfs" not in cluster.tags:
+                    raise OLMoConfigurationError(
+                        "NFS was requested but the cluster doesn't have access to NFS"
                     )
-                ),
-                propagate_failure=True if self.num_nodes > 1 else None,
-                propagate_preemption=True if self.num_nodes > 1 else None,
-                synchronized_start_timeout="90m" if self.num_nodes > 1 else None,
-                resources=TaskResources(gpu_count=self.num_gpus, shared_memory=self.shared_memory),
-                result_path=self.result_dir,
-            )
-            .with_dataset("/olmo-core", beaker=entrypoint_dataset.id)
-            .with_constraint(**constraints_kwargs)
-            .with_env_var(GIT_REPO_URL_ENV_VAR, self.git.repo_url)
-            .with_env_var(GIT_REF_ENV_VAR, self.git.ref)
-        )
+                recipe.mounts = ["/net/nfs.cirrascale"]
 
-        if self.git.branch is not None:
-            task_spec = task_spec.with_env_var(GIT_BRANCH_ENV_VAR, self.git.branch)
+            if self.weka_buckets:
+                if "storage:weka" not in cluster.tags:
+                    raise OLMoConfigurationError(
+                        "Weka buckets were requested but the cluster doesn't have access to Weka"
+                    )
+                recipe.weka = [(bucket, mount) for bucket, mount in self.weka_buckets]
 
-        for name, val in self._get_env_vars():
-            task_spec = task_spec.with_env_var(name=name, value=val)
+            if "provider:gcp" in cluster.tags:
+                if self.num_nodes > 0:
+                    recipe.post_setup = (
+                        "BEAKER_REPLICA_RANK=$("
+                        "python -m olmo_core.launch.reorder_ranks_in_gcp "
+                        "--verbose "
+                        "${BEAKER_REPLICA_RANK} "
+                        "${BEAKER_REPLICA_COUNT} "
+                        "${BEAKER_LEADER_REPLICA_HOSTNAME}"
+                        ")"
+                    )
 
-        for env_secret in self.env_secrets or []:
-            task_spec = task_spec.with_env_var(name=env_secret.name, secret=env_secret.secret)
+                if self.use_hostname_constraints:
+                    if self.retries is not None and self.retries > 0:
+                        raise OLMoConfigurationError(
+                            "Hostname constraints cannot be used for beaker jobs with retries since constraints do not update on retry."
+                        )
+                    host_name_constraints = get_beaker_hostname_constraints(
+                        self.num_nodes,
+                        self.num_execution_units or max(1, self.num_nodes // 32),
+                        1,
+                        "us-central1-b",
+                        beaker_cluster=self.cluster,
+                        beaker_priority=self.priority,
+                    )
+                    assert (
+                        len(host_name_constraints) == 1
+                        and len(host_name_constraints[0]) >= self.num_nodes
+                    )
+                    recipe.hostnames = host_name_constraints[0]
+                    recipe.clusters = []
 
-        if self.nfs:
-            task_spec = task_spec.with_dataset(
-                "/net/nfs.cirrascale", host_path="/net/nfs.cirrascale"
-            )
-            task_spec = task_spec.with_dataset("/net/nfs", host_path="/net/nfs.cirrascale")
-
-        if self.weka_buckets:
-            for bucket in self.weka_buckets:
-                task_spec = task_spec.with_dataset(bucket.mount, weka=bucket.bucket)
-
-        return ExperimentSpec(
-            description=self.description,
-            budget=self.budget,
-            tasks=[task_spec],
-            retry=None if not self.retries else RetrySpec(allowed_task_retries=self.retries),
-        )
+        return recipe
 
     def launch(
         self,
         follow: bool = False,
-        torchrun: Optional[bool] = None,
-        entrypoint: Optional[str] = None,
         slack_notifications: Optional[bool] = None,
-    ) -> Experiment:
+    ) -> BeakerWorkload:
         """
         Launch a Beaker experiment using this config.
 
@@ -602,123 +405,10 @@ class BeakerLaunchConfig(Config):
 
             slack_webhook_url = os.environ.get(SLACK_WEBHOOK_URL_ENV_VAR)
 
-        spec = self.build_experiment_spec(torchrun=torchrun, entrypoint=entrypoint)
-        experiment = self.beaker.experiment.create(self.name, spec)
-        log.info(f"Experiment submitted, see progress at {self.beaker.experiment.url(experiment)}")
+        recipe = self.build_recipe()
+        recipe.slack_webhook_url = slack_webhook_url
 
-        if not follow:
-            return experiment
-
-        try:
-            follow_experiment(self.beaker, experiment, slack_webhook_url=slack_webhook_url)
-        except KeyboardInterrupt:
-            log.warning("Caught keyboard interrupt...")
-            if Confirm.ask("Would you like to cancel the experiment?"):
-                self.beaker.experiment.stop(experiment)
-                log.warning(f"Experiment stopped: {self.beaker.experiment.url(experiment)}")
-            else:
-                log.info(
-                    "You can follow the experiment on the Beaker UI: "
-                    f"{self.beaker.experiment.url(experiment)}"
-                )
-
-        return experiment
-
-
-def follow_experiment(
-    beaker: Beaker,
-    experiment: Experiment,
-    tail: bool = False,
-    slack_webhook_url: Optional[str] = None,
-):
-    # Wait for job to start...
-    job: Optional[Job] = beaker.experiment.tasks(experiment.id)[0].latest_job  # type: ignore
-    if job is None:
-        log.info("Waiting for job to be created...")
-        while job is None:
-            time.sleep(1.0)
-            job = beaker.experiment.tasks(experiment.id)[0].latest_job  # type: ignore
-
-    # Pull events until job is running (or fails)...
-    events = set()
-    while not (job.is_finalized or job.is_running):
-        job = beaker.job.get(job.id)
-        for event in sorted(
-            beaker.job.summarized_events(job), key=lambda event: event.latest_occurrence
-        ):
-            if event not in events:
-                events.add(event)
-                log.info(f"❯ {event.latest_message}")
-                if event.status.lower() == "started":
-                    break
-        else:
-            time.sleep(1.0)
-            continue
-        break
-
-    if slack_webhook_url is not None:
-        _send_slack_notification_for_event(beaker, experiment, "launched", slack_webhook_url)
-
-    # Stream logs...
-    log.info("Showing logs:")
-    print()
-    for line_bytes in beaker.job.follow(
-        job,
-        include_timestamps=False,
-        since=None if not tail else timedelta(seconds=10),
-    ):
-        line = line_bytes.decode(errors="ignore")
-        if line.endswith("\n"):
-            line = line[:-1]
-        print(line)
-    print()
-    log.info("End logs")
-
-    # Refresh the job.
-    job = beaker.job.get(job.id)
-    exit_code = job.status.exit_code
-
-    if exit_code is None:
-        if slack_webhook_url is not None:
-            _send_slack_notification_for_event(beaker, experiment, "failed", slack_webhook_url)
-        raise BeakerExperimentFailedError(
-            f"Experiment failed, see {beaker.experiment.url(experiment)} for details"
-        )
-    elif exit_code > 0:
-        if slack_webhook_url is not None:
-            _send_slack_notification_for_event(beaker, experiment, "failed", slack_webhook_url)
-        raise BeakerExperimentFailedError(
-            f"Experiment exited with non-zero code ({exit_code}), "
-            f"see {beaker.experiment.url(experiment)} for details"
-        )
-    else:
-        log.info(f"Experiment completed successfully: {beaker.experiment.url(experiment)}")
-        if slack_webhook_url is not None:
-            _send_slack_notification_for_event(beaker, experiment, "succeeded", slack_webhook_url)
-
-
-def _send_slack_notification_for_event(
-    beaker: Beaker,
-    experiment: Experiment,
-    event: Literal["launched", "succeeded", "failed"],
-    webhook_url: str,
-):
-    workload_name = experiment.full_name
-    workload_url = beaker.experiment.url(experiment)
-
-    if event == "launched":
-        text = f":check: Run <{workload_url}|*{workload_name}*> has launched! :runner:"
-    elif event == "failed":
-        text = f":check-failed: Run <{workload_url}|*{workload_name}*> failed!"
-    elif event == "succeeded":
-        text = f":check: Run <{workload_url}|*{workload_name}*> succeeded!"
-    else:
-        raise ValueError(f"Unknown event: {event}")
-
-    try:
-        requests.post(webhook_url, json={"text": text})
-    except Exception as e:
-        log.exception(f"Failed to send Slack notification: {e}")
+        return recipe.launch(show_logs=follow)
 
 
 def _parse_args():
@@ -761,14 +451,13 @@ def _parse_args():
     parser.add_argument(
         "--cluster",
         type=str,
-        nargs="*",
-        default=["ai2/jupiter", "ai2/ceres", "ai2/saturn", "ai2/prometheus"],
-        help="""Clusters to launch on (multiple allowed).""",
+        default="ai2/jupiter",
+        help="""Cluster to launch on.""",
     )
     parser.add_argument(
         "--priority",
-        choices=[p.value for p in Priority],
-        default=Priority.normal,
+        choices=["low", "normal", "high", "urgent"],
+        default="normal",
         help="The priority level.",
     )
     parser.add_argument(
@@ -838,21 +527,21 @@ def _parse_args():
 
 
 def _build_config(opts: argparse.Namespace, command: List[str]) -> BeakerLaunchConfig:
-    env_vars: List[BeakerEnvVar] = []
+    env_vars: List[Tuple[str, str]] = []
     if opts.debug:
-        env_vars.append(BeakerEnvVar(name="CUDA_LAUNCH_BLOCKING", value="1"))
-        env_vars.append(BeakerEnvVar(name="NCCL_DEBUG", value="INFO"))
+        env_vars.append(("CUDA_LAUNCH_BLOCKING", "1"))
+        env_vars.append(("NCCL_DEBUG", "INFO"))
     for e in opts.env or []:
         if "=" not in e:
             raise ValueError(f"Invalid env var '{e}', must be in the form NAME=VALUE")
         name, value = e.split("=", 1)
-        env_vars.append(BeakerEnvVar(name=name, value=value))
-    env_secrets: List[BeakerEnvSecret] = []
+        env_vars.append((name, value))
+    env_secrets: List[Tuple[str, str]] = []
     for e in opts.env_secret or []:
         if "=" not in e:
             raise ValueError(f"Invalid env secret '{e}', must be in the form NAME=SECRET_NAME")
         name, secret = e.split("=", 1)
-        env_secrets.append(BeakerEnvSecret(name=name, secret=secret))
+        env_secrets.append((name, secret))
     return BeakerLaunchConfig(
         name=f"{opts.name}-{generate_uuid()[:8]}",
         budget=opts.budget,
@@ -861,7 +550,7 @@ def _build_config(opts: argparse.Namespace, command: List[str]) -> BeakerLaunchC
         env_secrets=env_secrets,
         task_name=opts.task_name,
         description=opts.description,
-        clusters=opts.cluster,
+        cluster=opts.cluster,
         num_nodes=opts.nodes,
         num_gpus=opts.gpus,
         preemptible=opts.preemptible,
@@ -870,9 +559,7 @@ def _build_config(opts: argparse.Namespace, command: List[str]) -> BeakerLaunchC
         workspace=opts.workspace,
         allow_dirty=opts.allow_dirty,
         shared_filesystem=opts.shared_filesystem,
-        weka_buckets=[
-            BeakerWekaBucket(bucket=bucket, mount=f"/weka/{bucket}") for bucket in (opts.weka or [])
-        ],
+        weka_buckets=[(bucket, f"/weka/{bucket}") for bucket in (opts.weka or [])],
     )
 
 
@@ -883,7 +570,7 @@ def main():
     if opts.dry_run:
         rich.print(config)
     else:
-        config.launch(torchrun=opts.torchrun, follow=True)
+        config.launch(follow=True)
 
 
 if __name__ == "__main__":
