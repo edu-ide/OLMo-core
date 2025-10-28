@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 
 GOOGLE_CLUSTERS = [
     "ai2/augusta",
+    "ai2/augusta-test",
 ]
 
 
