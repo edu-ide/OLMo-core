@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `ignore_fingerprint_mismatch` parameter to `NumpyDataLoaderConfig` to allow resuming training from a checkpoint with a different dataset mix.
 - Added helpful error messages when OLMo-mix-0625 files are not found, directing users to use OLMo-mix-0925 and the fingerprint override flag.
 - Added `GradientDumperCallback` for saving gradient shards during FSDP/HSDP training and `reconstruct_gradients.py` script for combining shards into full gradients. Gradients are saved as safetensors with embedded DTensor metadata (shard dimension, full shape) for accurate reconstruction. Supports two modes: per-rank sharded saving for full reconstruction, or preview mode (`save_first_n`) to gather and save only the first N elements to rank 0 for quick inspection. Files are organized into step-specific directories.
+- Added `olmo_core.generate.chat` module to allow interacting with OlmoCore models without conversion to other formats.
+- Added a `NoOpOptimizer` that does nothing, uses no memory, and can be used for debugging.
+
+### Fixed
+
+- Set missing `NCCL_NVLSTREE_MAX_CHUNKSIZE` env var that is now needed for running jobs on Augusta cluster.
+- No longer overrides `random`'s RNG seed when building `SourceMixtureDatasetConfig`.
 
 ## [v2.3.0](https://github.com/allenai/OLMo-core/releases/tag/v2.3.0) - 2025-10-17
 
@@ -158,7 +165,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed Attention block sharding when TP and head-wise QK norm are both applied.
 - Added RoPE scaling configs to `rope` module's exports.
 
-
 ## [v2.1.0](https://github.com/allenai/OLMo-core/releases/tag/v2.1.0) - 2025-04-14
 
 ### Added
@@ -194,7 +200,6 @@ Also added lower-level methods for converting state between the formats.
 - Made Beaker image resolution more robust.
 - Having `t_max` overrides in the default model configs is confusing and error prone, so we removed them.
 - Beaker launcher will only clone a single branch at runtime when possible, which can be much faster.
-
 
 ## [v2.0.1](https://github.com/allenai/OLMo-core/releases/tag/v2.0.1) - 2025-03-18
 
