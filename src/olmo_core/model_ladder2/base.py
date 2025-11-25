@@ -38,4 +38,14 @@ class ModelLadderExperiment(Config, Generic[R], metaclass=ABCMeta):
 
     @abstractmethod
     def run(self, run: R, overrides: list[str] | None = None):
+        """
+        Execute a particular run of the experiment locally and store the results.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_metrics_for_run(self, run: R, overrides: list[str] | None = None) -> dict[str, float]:
+        """
+        Retrieve the final metrics for a particular run of the experiment.
+        """
         raise NotImplementedError
