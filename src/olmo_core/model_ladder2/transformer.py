@@ -22,7 +22,6 @@ from olmo_core.exceptions import OLMoConfigurationError
 from olmo_core.nn.transformer import TransformerConfig
 from olmo_core.optim import (
     CosWithWarmupAndLinearDecay,
-    OptimConfig,
     OptimGroupOverride,
     SkipStepAdamWConfig,
 )
@@ -38,7 +37,7 @@ from olmo_core.train.train_module import (
     TransformerTrainModuleConfig,
 )
 
-from .base import ModelLadderExperiment, ModelLadderRun
+from .base import ModelLadder
 
 
 class TransformerSize(StrEnum):
@@ -76,28 +75,15 @@ class TransformerLadderRunComponents(Config):
 
 
 @dataclass(kw_only=True)
-class TransformerLadderRun(ModelLadderRun):
+class TransformerSpec(Config):
     """
-    Defines a single run within a :class:`TransformerLadderExperiment`.
+    Defines a single model within a :class:`TransformerLadder`.
 
     By default this will use the OLMo3 architecture, but subclasses can override :meth:`configure_model()`
     to customize it.
     """
 
     size: TransformerSize
-    chinchilla_multiple: float
-    sequence_length: int
-    batch_size: int
-
-    def __post_init__(self):
-        if self.chinchilla_multiple <= 0:
-            raise OLMoConfigurationError("'chinchilla_multiple' must be positive")
-        if self.sequence_length <= 0:
-            raise OLMoConfigurationError("'sequence_length' must be positive")
-        if self.batch_size <= 0:
-            raise OLMoConfigurationError("'batch_size' must be positive")
-        if self.batch_size % self.sequence_length != 0:
-            raise OLMoConfigurationError("'batch_size' must be a multiple of 'sequence_length'")
 
     @property
     def target_num_parameters(self) -> int:
@@ -108,16 +94,6 @@ class TransformerLadderRun(ModelLadderRun):
             return int(float(value) * multiplier)
         else:
             raise ValueError(f"Invalid size descriptor '{self.size}'")
-
-    @property
-    def duration(self) -> Duration:
-        return Duration.chinchilla_tokens(
-            self.chinchilla_multiple, model_params=self.target_num_parameters
-        )
-
-    @property
-    def id(self) -> str:
-        return f"{self.size}-{self.chinchilla_multiple:.2f}xC-{self.sequence_length}CL-{self.batch_size}BZ"
 
     def configure_model(self, vocab_size: int) -> TransformerConfig:
         model: TransformerConfig
@@ -139,79 +115,39 @@ class TransformerLadderRun(ModelLadderRun):
             model = TransformerConfig.olmo3_13B(vocab_size)
         else:
             raise OLMoConfigurationError(f"Unsupported model size '{self.size}'")
+
         # Make sure actual number of params is close to target number.
         if (
             pct_diff := (
-                math.fabs(model.num_params - self.target_num_parameters)
+                math.fabs(model.num_non_embedding_params - self.target_num_parameters)
                 / self.target_num_parameters
             )
         ) > 0.05:
             warnings.warn(
-                f"Configured model has {model.num_params:,d} parameters, "
+                f"Configured model has {model.num_non_embedding_params:,d} (non-embedding) parameters, "
                 f"which differs from target of {self.size} by ~{100 * pct_diff:.1f}%.",
                 UserWarning,
             )
         return model
 
-    def configure_optimizer(self) -> OptimConfig:
-        # Calculate LR according to https://api.semanticscholar.org/CorpusID:270764838
-        #  assert self.sequence_length in {2048, 4096}
-        lr = 0.0047 * (self.target_num_parameters / 108000000) ** (-1 / 3)
-
-        return SkipStepAdamWConfig(
-            lr=lr,
-            weight_decay=0.1,
-            betas=(0.9, 0.95),
-            group_overrides=[
-                OptimGroupOverride(params=["embeddings.weight"], opts=dict(weight_decay=0.0))
-            ],
-        )
-
-    def configure_mbz(self) -> int:
-        # Assumes H100 with 80GB memory.
-        if self.target_num_parameters <= 370e6:
-            return 16 * 4096
-        elif self.target_num_parameters <= 760e6:
-            return 10 * 4096
-        elif self.target_num_parameters <= 1e9:
-            return 8 * 4096
-        elif self.target_num_parameters <= 7e9:
-            return 4 * 4096
-        else:
-            return 2 * 4096
-
-    def configure_train_module(self) -> TransformerTrainModuleConfig:
-        mbz = max(self.sequence_length, self.configure_mbz())
-        return TransformerTrainModuleConfig(
-            rank_microbatch_size=mbz,
-            max_sequence_length=self.sequence_length,
-            optim=self.configure_optimizer(),
-            compile_model=True,
-            dp_config=TransformerDataParallelConfig(
-                name=DataParallelType.hsdp,
-                param_dtype=DType.bfloat16,
-                reduce_dtype=DType.float32,
-                wrapping_strategy=TransformerDataParallelWrappingStrategy.blocks,
-            ),
-            z_loss_multiplier=1e-5,
-            max_grad_norm=1.0,
-            scheduler=CosWithWarmupAndLinearDecay(
-                warmup_steps=round(self.target_num_parameters / self.batch_size)
-            ),
-        )
-
 
 @dataclass(kw_only=True)
-class TransformerLadderExperiment(ModelLadderExperiment[TransformerLadderRun]):
+class TransformerLadder(ModelLadder[TransformerSpec]):
     mix: DataMix
     mix_base_dir: str = "gs://ai2-llm"
     tokenizer: TokenizerConfig
+    chinchilla_multiple: float
+    sequence_length: int = 4096
     intra_document_masking: bool = False
     instance_filter: bool = False
     backend: str = "cpu:gloo,cuda:nccl"
 
-    def run(self, run: TransformerLadderRun, overrides: list[str] | None = None):
-        config = self.configure_run_components(run, overrides)
+    def __post_init__(self):
+        if self.chinchilla_multiple <= 0:
+            raise OLMoConfigurationError("'chinchilla_multiple' must be positive")
+
+    def run(self, model_spec: TransformerSpec, overrides: list[str] | None = None):
+        config = self.configure_run_components(model_spec, overrides)
         prepare_training_environment(backend=config.backend, seed=self.seed)
 
         try:
@@ -241,33 +177,99 @@ class TransformerLadderExperiment(ModelLadderExperiment[TransformerLadderRun]):
             teardown_training_environment()
 
     def get_metrics_for_run(
-        self, run: TransformerLadderRun, overrides: list[str] | None = None
-    ) -> dict[str, float]:
-        config = self.configure_run_components(run, overrides)
-        path = io.resource_path(config.trainer.save_folder, "metrics.json")
+        self, model_spec: TransformerSpec, overrides: list[str] | None = None
+    ) -> dict[str, float] | None:
+        config = self.configure_run_components(model_spec, overrides)
+        try:
+            path = io.resource_path(config.trainer.save_folder, "metrics.json")
+        except FileNotFoundError:
+            return None
+
         with path.open("r") as f:
             return json.load(f)
 
     def configure_run_components(
-        self, run: TransformerLadderRun, overrides: list[str] | None = None
+        self, model_spec: TransformerSpec, overrides: list[str] | None = None
     ) -> TransformerLadderRunComponents:
         if overrides:
             self = self.merge(overrides, strict=False)
 
-        save_folder = io.join_path(
-            self.root_dir, io.make_url_safe(self.name), run.id, f"seed-{self.seed}"
+        run_id = (
+            f"{model_spec.size}-{self.chinchilla_multiple:.2f}xC-{self.sequence_length}-{self.seed}"
         )
+        run_name = f"{self.name}-{run_id}"
+        save_folder = io.join_path(self.root_dir, io.make_url_safe(self.name), run_id)
         work_dir = (
             "./cache" if io.is_url(self.root_dir) else str(io.join_path(self.root_dir, "cache"))
         )
-        run_name = f"{self.name}-{run.id}-seed-{self.seed}"
+
+        model = model_spec.configure_model(self.tokenizer.padded_vocab_size())
+
+        # Calculate training duration based on Chinchilla scaling laws.
+        duration = Duration.chinchilla_tokens(
+            self.chinchilla_multiple,
+            model_params=model.num_non_embedding_params,
+            #  model_params=run.target_num_parameters,
+        )
+
+        # Calculate LR according to https://api.semanticscholar.org/CorpusID:270764838
+        lr = 0.0047 * (model.num_non_embedding_params / 108_000_000) ** (-1 / 3)
+        optim = SkipStepAdamWConfig(
+            lr=lr,
+            weight_decay=0.1,
+            betas=(
+                0.9,
+                0.95,  # NOTE: paper above suggest using larger beta2 (~0.99) for small batch sizes.
+            ),
+            group_overrides=[
+                OptimGroupOverride(params=["embeddings.weight"], opts=dict(weight_decay=0.0))
+            ],
+        )
+
+        # Calculate global batch size according to https://api.semanticscholar.org/CorpusID:270764838
+        # which assumes a sequence length of 2048.
+        gbz = round(2048 * 160 * (model.num_non_embedding_params / 108_000_000) ** (2 / 3))
+
+        # Estimate micro-batch size based on number of parameters.
+        # Assumes H100 with 80GB memory.
+        mbz: int
+        if model.num_non_embedding_params <= 370e6:
+            mbz = 16 * 4096
+        elif model.num_non_embedding_params <= 760e6:
+            mbz = 10 * 4096
+        elif model.num_non_embedding_params <= 1e9:
+            mbz = 8 * 4096
+        elif model.num_non_embedding_params <= 7e9:
+            mbz = 4 * 4096
+        else:
+            mbz = 2 * 4096
+        mbz = max(self.sequence_length, mbz)
+
+        train_module = TransformerTrainModuleConfig(
+            rank_microbatch_size=mbz,
+            max_sequence_length=self.sequence_length,
+            optim=optim,
+            compile_model=True,
+            dp_config=TransformerDataParallelConfig(
+                name=DataParallelType.hsdp,
+                param_dtype=DType.bfloat16,
+                reduce_dtype=DType.float32,
+                wrapping_strategy=TransformerDataParallelWrappingStrategy.blocks,
+            ),
+            z_loss_multiplier=1e-5,
+            max_grad_norm=1.0,
+            scheduler=CosWithWarmupAndLinearDecay(
+                # warm up 1 token per parameter according to https://api.semanticscholar.org/CorpusID:270764838
+                warmup_steps=round(model.num_non_embedding_params / gbz)
+            ),
+        )
 
         trainer = TrainerConfig(
             save_folder=str(save_folder),
             work_dir=str(work_dir),
             metrics_collect_interval=10,
             cancel_check_interval=10,
-            max_duration=run.duration,
+            max_duration=duration,
             callbacks={
                 "gpu_monitor": callbacks.GPUMemoryMonitorCallback(),
                 "config_saver": callbacks.ConfigSaverCallback(),
@@ -296,16 +298,17 @@ class TransformerLadderExperiment(ModelLadderExperiment[TransformerLadderRun]):
                 ),
             },
         )
+
         components = TransformerLadderRunComponents(
-            model=run.configure_model(self.tokenizer.padded_vocab_size()),
-            train_module=run.configure_train_module(),
+            model=model,
+            train_module=train_module,
             trainer=trainer,
             dataset=NumpyFSLDatasetConfig.from_data_mix(
                 self.mix,
                 mix_base_dir=self.mix_base_dir,
                 tokenizer=self.tokenizer,
                 work_dir=work_dir,
-                sequence_length=run.sequence_length,
+                sequence_length=self.sequence_length,
                 generate_doc_lengths=self.intra_document_masking,
                 instance_filter_config=None
                 if not self.instance_filter
@@ -313,9 +316,7 @@ class TransformerLadderExperiment(ModelLadderExperiment[TransformerLadderRun]):
                     repetition_max_period=13, repetition_min_period=1, repetition_max_count=32
                 ),
             ),
-            data_loader=NumpyDataLoaderConfig(
-                global_batch_size=run.batch_size, seed=self.seed, num_workers=4
-            ),
+            data_loader=NumpyDataLoaderConfig(global_batch_size=gbz, seed=self.seed, num_workers=4),
             backend=self.backend,
             seed=self.seed,
         )
