@@ -56,6 +56,9 @@ class RunConfigurator(Config, metaclass=ABCMeta):
     Defines how to configure a run for a model of particular size.
     """
 
+    max_devices: int
+    sequence_length: int
+
     @property
     @abstractmethod
     def fingerprint(self) -> str:
@@ -99,19 +102,26 @@ class WSDSChinchillaRunConfigurator(RunConfigurator):
     How long to train each run for, expressed as a multiple of the Chinchilla-optimal duration
     which must be a power of 2.
     """
-    decay_factor: float = 2.0
-    """The duration of each decay in the WSD-S schedule as factor of the initial warmup."""
+    decay_fraction: float = 0.1
+    """The duration of each decay as a fraction of the period. Must be at least 10%."""
 
     def __post_init__(self):
-        if self.chinchilla_multiple <= 0:
-            raise OLMoConfigurationError("'chinchilla_multiple' must be positive")
-        log2_cm = math.log(self.chinchilla_multiple, 2)
-        if not log2_cm.is_integer():
-            raise OLMoConfigurationError("'chinchilla_multiple' must be a power of 2")
+        if self.max_devices <= 0 or not math.log(self.max_devices, 2).is_integer():
+            raise OLMoConfigurationError("'max_devices' must be positive power of 2")
+        if self.sequence_length <= 0 or not math.log(self.sequence_length, 2).is_integer():
+            raise OLMoConfigurationError("'sequence_length' must be positive power of 2")
+        if self.chinchilla_multiple < 0.5 or not math.log(self.chinchilla_multiple, 2).is_integer():
+            raise OLMoConfigurationError(
+                "'chinchilla_multiple' must be at least 0.5 and a power of 2"
+            )
+        if not (0 < self.decay_fraction < 0.5):
+            raise OLMoConfigurationError(
+                "'decay_fraction' must be greater than 0.0 and less than 0.5"
+            )
 
     @property
     def fingerprint(self) -> str:
-        return f"WSD-S_{self.chinchilla_multiple}xC_DF{self.decay_factor}_v{self.VERSION}"
+        return f"WSD-S_{self.decay_fraction}DF_{self.max_devices}GPUs_{self.sequence_length}CL_v{self.VERSION}"
 
     def configure_duration(self, num_params: int) -> Duration:
         return Duration.chinchilla_tokens(
@@ -122,7 +132,10 @@ class WSDSChinchillaRunConfigurator(RunConfigurator):
     def configure_batch_size(self, num_params: int) -> int:
         # Calculate global batch size according to https://api.semanticscholar.org/CorpusID:270764838
         # which assumes a sequence length of 2048.
-        return round(2048 * 160 * (num_params / 108_000_000) ** (2 / 3))
+        batch_size = round(2048 * 160 * (num_params / 108_000_000) ** (2 / 3))
+        # Make sure it's a multiple of 'sequence_length x max_devices'.
+        factor = self.sequence_length * self.max_devices
+        return round(batch_size / factor) * factor
 
     def configure_optimizer(self, num_params: int) -> SkipStepAdamWConfig:
         # Calculate LR according to https://api.semanticscholar.org/CorpusID:270764838
@@ -141,38 +154,22 @@ class WSDSChinchillaRunConfigurator(RunConfigurator):
             ],
         )
 
-    def configure_chinchilla_periods(self, num_params: int) -> tuple[int, int, list[float]]:
+    def configure_chinchilla_periods(self, num_params: int) -> tuple[int, list[float]]:
         # Warm up 1 token per parameter according to https://api.semanticscholar.org/CorpusID:270764838
         warmup = num_params
-        decay = round(warmup * self.decay_factor)
-
-        # Determine minimum spacing for decay periods.
-        # Assume we should be in stable era in the first period for at least 80% of the period,
-        # meaning warmup + decay is no more than 20% of the period.
-        min_tokens_per_period = (warmup + decay) / 0.2
-        # Then convert that to a Chinchilla multiple.
-        min_chinchilla_period = math.ceil(
-            min_tokens_per_period / Duration.chinchilla_tokens(1.0, model_params=num_params).value
-        )
-        if self.chinchilla_multiple < min_chinchilla_period:
-            raise OLMoConfigurationError(
-                f"'chinchilla_multiple={self.chinchilla_multiple}' is too small relative to warmup and decay. "
-                f"You'll need a chinchilla multiple of at least {min_chinchilla_period} or a smaller decay factor."
-            )
 
         # Generate Chinchilla (decay) periods as multiples of two, but at least the minimum.
         chinchilla_periods: list[float] = []
         max_pow = math.log(self.chinchilla_multiple, 2)
         assert max_pow.is_integer()  # checked in `__post_init__()` as well.
-        for p in range(int(max_pow) + 1):
+        for p in range(-1, int(max_pow) + 1):
             period = 2**p
-            if period >= min_chinchilla_period:
-                chinchilla_periods.append(period)
+            chinchilla_periods.append(period)
 
-        return warmup, decay, chinchilla_periods
+        return warmup, chinchilla_periods
 
     def configure_lr_scheduler(self, num_params: int) -> Scheduler:
-        warmup, decay, chinchilla_periods = self.configure_chinchilla_periods(num_params)
+        warmup, chinchilla_periods = self.configure_chinchilla_periods(num_params)
         period_lengths = []
         for pidx, c in enumerate(chinchilla_periods):
             period = Duration.chinchilla_tokens(c, model_params=num_params).value
@@ -189,7 +186,7 @@ class WSDSChinchillaRunConfigurator(RunConfigurator):
         return WSDS(
             units=SchedulerUnits.tokens,
             warmup=warmup,
-            decay=decay,
+            decay_fraction=self.decay_fraction,
             period_lengths=period_lengths,
         )
 
@@ -199,7 +196,7 @@ class WSDSChinchillaRunConfigurator(RunConfigurator):
 
         optim = self.configure_optimizer(num_params)
         scheduler = self.configure_lr_scheduler(num_params)
-        warmup, decay, chinchilla_periods = self.configure_chinchilla_periods(num_params)
+        warmup, chinchilla_periods = self.configure_chinchilla_periods(num_params)
         t_max = self.configure_duration(num_params).value
         batch_size = self.configure_batch_size(num_params)
         tokens_seen = 0
@@ -212,7 +209,7 @@ class WSDSChinchillaRunConfigurator(RunConfigurator):
             lrs.append(lr)
 
         df = pd.DataFrame({"tokens": tokens, "lr": lrs})
-        df.plot(x="tokens", y="lr")
+        df.plot(x="tokens", y="lr", legend=False)
         plt.grid(True)
 
         for c in chinchilla_periods:
@@ -221,18 +218,23 @@ class WSDSChinchillaRunConfigurator(RunConfigurator):
             period = Duration.chinchilla_tokens(c, model_params=num_params).value
             plt.axvline(x=period, color="red", linestyle="--", alpha=0.5, label=f"{c}xC")
             plt.text(
-                period - 0.5 * decay,
+                period + warmup,
                 0.0,
                 f"{c}xC",
                 color="red",
                 alpha=0.5,
-                horizontalalignment="right",
+                horizontalalignment="left",
+                rotation=45,
             )
 
-        chinchilla_tokens = Duration.chinchilla_tokens(1.0, model_params=num_params).value
-        caption = f"warmup={format_tokens(warmup)}, 1xC={format_tokens(chinchilla_tokens)}, duration={format_tokens(t_max)}"
-        plt.xlabel(f"Tokens\n{caption}")
         plt.title(f"Learning rate schedule out to {self.chinchilla_multiple}xC")
+
+        caption = (
+            f"peak LR={optim.lr:.6f}, batch size={format_tokens(batch_size)}\n"
+            f"warmup={format_tokens(warmup)}={warmup // batch_size:,d} steps, "
+            f"duration={format_tokens(t_max)}={t_max // batch_size:,d} steps"
+        )
+        plt.xlabel(f"Tokens\n\n{caption}")
 
         plt.tight_layout()
         plt.show()
