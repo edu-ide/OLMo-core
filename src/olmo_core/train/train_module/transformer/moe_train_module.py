@@ -249,7 +249,8 @@ class MoEV2TransformerTrainModule(TrainModule):
             rank_microbatch_size=rank_microbatch_size,
         )
 
-        self._cast_to_fwd_bwd_precision(self.model_parts)
+        # self._copy_full_precision_to_low_precision_params()
+        # self._cast_to_fwd_bwd_precision(self.model_parts)
 
         import torch._dynamo.config as dynamo_cfg
         dynamo_cfg.recompile_limit = 64  # or any higher number you want
@@ -779,6 +780,8 @@ class MoEV2TransformerTrainModule(TrainModule):
             )
 
         #############################
+        # self._point_to_low_precision_params()
+
         if not self.pp_enabled:
             # Calculate how many tokens are going to be used in the loss.
             batch_num_tokens_for_loss = move_to_device(
@@ -891,6 +894,8 @@ class MoEV2TransformerTrainModule(TrainModule):
             
         #############################
         # debug_norm = [torch.nn.utils.get_total_norm([p.grad for p in model_part.parameters()]) for model_part in self.model_parts]
+
+        # self._point_to_full_precision_params()
 
         for model in self.model_parts:
             model.post_batch(dry_run=dry_run)
@@ -1097,6 +1102,34 @@ class MoEV2TransformerTrainModule(TrainModule):
 
         return schedule_outputs
     
+    def _point_to_low_precision_params(self):
+        for model in self.model_parts:
+            for name, param in model.named_parameters():
+                if hasattr(param, "_ddp_ignored") and param._ddp_ignored:
+                    continue
+                param.data = param._mp_param
+
+    def _point_to_full_precision_params(self):
+        for model in self.model_parts:
+            for name, param in model.named_parameters():
+                if hasattr(param, "_ddp_ignored") and param._ddp_ignored:
+                    continue
+                param.data = param._mp_param
+
+    def _copy_full_precision_to_low_precision_params(self):
+        from torch.distributed.utils import _alloc_storage
+         
+        for model in self.model_parts:
+            for name, param in model.named_parameters():
+                if hasattr(param, "_ddp_ignored") and param._ddp_ignored:
+                    continue
+                _alloc_storage(param._mp_param, param.size())
+                with torch.no_grad():
+                    # assert param.data == param._fp_param, "param.data should point to param._fp_param before copy"
+                    assert param.data.dtype == torch.float32, "param.data should be float32 before copy"
+                    param._mp_param.copy_(param.data)
+
+
     def run_pipeline(
         self,
         input_ids: torch.Tensor,
@@ -1141,6 +1174,9 @@ class MoEV2TransformerTrainModule(TrainModule):
 
         # Step optimizer.
         self.optim.step()
+
+        # self._copy_full_precision_to_low_precision_params()
+
         total_grad_norm = self.optim.latest_grad_norm
 
         if total_grad_norm is not None:

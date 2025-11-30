@@ -33,6 +33,7 @@ from olmo_core.ops import moe as ops
 from ...lm_head import LMHeadConfig, LMOutputWithLoss
 import nvtx
 from torch.utils.checkpoint import checkpoint, CheckpointFunction
+from torch.distributed._composable.replicate import replicate
 
 from ..utils import (
     moe_unpermute_no_compile,
@@ -82,6 +83,23 @@ recompute_context_fn = noop_context_fn # don't use selective checkpointing for n
 # from olmo_core.nn.utils import selective_checkpointing_context_fn
 # recompute_context_fn = selective_checkpointing_context_fn
 
+from functools import partial
+def _grad_acc_post_hook(param: torch.Tensor, *, _p):
+    g = _p.grad
+    if g is None:
+        return
+    # upcast and accumulate in-place (no graph)
+
+    if _p._main_grad_fp32 is None: # type: ignore[attr-defined]
+        # first time init
+        _p._main_grad_fp32 = g.to(torch.float32) # type: ignore[attr-defined]
+    else:
+        # _p._main_grad_fp32.add_(g.to(torch.float32)) # type: ignore[attr-defined]
+        _p._main_grad_fp32.add_(g) # type: ignore[attr-defined]
+    # drop BF16 .grad to avoid double-accum & save memory
+    _p.grad = None
+
+
 class MoEFusedV2Transformer(olmo_core.nn.transformer.Transformer):
     """
     An MoE transformer implementation, to be used with one of the
@@ -97,6 +115,7 @@ class MoEFusedV2Transformer(olmo_core.nn.transformer.Transformer):
 
         super().__init__(*args, **kwargs)
         self.ep_enabled = False # default
+        self._ep_modules = []
 
         assert not (self.recompute_all_blocks_by_chunk and self.recompute_each_block), "Only one of recompute_all_blocks_by_chunk and recompute_each_block can be True."
         assert not (self.tbo and self.recompute_each_block), "Cannot use TBO when recompute_each_block is True."
@@ -226,7 +245,6 @@ class MoEFusedV2Transformer(olmo_core.nn.transformer.Transformer):
         """
         Apply DDP to the model.
         """
-        from torch.distributed._composable.replicate import replicate
 
         # Cast model explicitly to the specified dtype before applying DDP
         target_dtype = param_dtype or self.dtype
@@ -266,7 +284,6 @@ class MoEFusedV2Transformer(olmo_core.nn.transformer.Transformer):
         """
         Apply DDP to the model.
         """
-        from torch.distributed._composable.replicate import replicate
 
         for block in self.blocks.values():
             if not block.is_moe:
@@ -275,29 +292,27 @@ class MoEFusedV2Transformer(olmo_core.nn.transformer.Transformer):
             block.apply_ep(ep_mesh)
 
 
-        # Cast model explicitly to the specified dtype before applying DDP
-        # target_dtype = param_dtype or self.dtype
-        # if target_dtype != self.dtype:
-        #     self.to(dtype=target_dtype)
 
-        # TODO: check if this is needed
-        # Adapted from
-        # https://github.com/pytorch/torchtitan/blob/90c889e972b56b9faadebbb78fc985dedc537ed9/torchtitan/parallelisms/parallelize_llama.py#L328
-        # if compile_enabled:
-        #     if autograd_compile_enabled:
-        #         torch._dynamo.config.optimize_ddp = "python_reducer_without_compiled_forward"  # type: ignore
-        #     else:
-        #         torch._dynamo.config.optimize_ddp = "ddp_optimizer"  # type: ignore
-                
-        # TODO: here the replicate/DDP wrapper takes the model in original precision (mostly fp32)
-        # but later the wrapper model converts to bf16, will there be a problem?
+        from torch.nn.parallel.distributed import _MixedPrecision
+
+        self.to(torch.bfloat16) # HACK, need fix
+
+        mixed_precision = _MixedPrecision(
+            # param_dtype = torch.bfloat16,
+            param_dtype = None,
+            reduce_dtype = torch.float32,
+            buffer_dtype = torch.float32,
+        )
         
-        ep_modules = [m for m in self.modules() if getattr(m, '_ep_sharded', False) ] # collect the ep sharded part based on `_ep_sharded` field (will be set to True in `apply_ep`)
-        replicate(self, device_mesh=dp_mesh, bucket_cap_mb=100, ignored_modules=ep_modules, gradient_as_bucket_view=True) # dense ddp
+
+        self._ep_modules = [m for m in self.modules() if getattr(m, '_ep_sharded', False) ] # collect the ep sharded part based on `_ep_sharded` field (will be set to True in `apply_ep`)
+        replicate(self, device_mesh=dp_mesh, bucket_cap_mb=100, ignored_modules=self._ep_modules, gradient_as_bucket_view=True, 
+                    mixed_precision=mixed_precision
+                  ) # dense ddp
 
         ep_dp_mesh = ep_mesh['ep_dp']
-        for m in ep_modules:
-            replicate(m, device_mesh=ep_dp_mesh, bucket_cap_mb=100, gradient_as_bucket_view=True) # moe ddp
+        for m in self._ep_modules:
+            replicate(m, device_mesh=ep_dp_mesh, bucket_cap_mb=100, gradient_as_bucket_view=True, mixed_precision=mixed_precision) # moe ddp
         # Some inputs need to be on CPU initially, but DDP will move everything to model's
         # device if we don't hide it.
         from ...transformer.model import _hide_cpu_inputs_from_torch, _unhide_cpu_inputs_from_torch
@@ -463,6 +478,12 @@ class MoEFusedV2Transformer(olmo_core.nn.transformer.Transformer):
         # get one next int from the generator
         # if everything goes right, all ranks should have the same next int
         valid_test = torch.randint(0, 1000000, (1,), generator=generator, device=device).cpu().item() # attach debugger to check
+
+        # call lazy_init to make sure params has the _mp_param and _fp_param fields
+        replicate.state(self).lazy_init()
+        for ep_module in self._ep_modules:
+            replicate.state(ep_module).lazy_init()
+
         return generator
 
     def attach_fp32_accum(self):
@@ -473,22 +494,7 @@ class MoEFusedV2Transformer(olmo_core.nn.transformer.Transformer):
             # persistent FP32 master grad on the same device
             p._main_grad_fp32 = None # type: ignore[attr-defined]
 
-            def _post_hook(param: torch.Tensor, *, _p=p):
-                g = _p.grad
-                if g is None:
-                    return
-                # upcast and accumulate in-place (no graph)
-
-                if _p._main_grad_fp32 is None: # type: ignore[attr-defined]
-                    # first time init
-                    _p._main_grad_fp32 = g.to(torch.float32) # type: ignore[attr-defined]
-                else:
-                    # _p._main_grad_fp32.add_(g.to(torch.float32)) # type: ignore[attr-defined]
-                    _p._main_grad_fp32.add_(g) # type: ignore[attr-defined]
-                # drop BF16 .grad to avoid double-accum & save memory
-                _p.grad = None
-
-            p.register_post_accumulate_grad_hook(_post_hook)
+            p.register_post_accumulate_grad_hook(partial(_grad_acc_post_hook, _p=p))
 
     def set_main_grads_to_none(self):
         for p in self.parameters():

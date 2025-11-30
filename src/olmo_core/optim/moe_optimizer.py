@@ -372,7 +372,7 @@ class MoEFusedV2Optimizer:
         self._dp_group: Optional[ProcessGroup] = dp_group
         self._ep_dp_group: Optional[ProcessGroup] = ep_dp_group
 
-        self._broadcast_bucket_bytes: int = int(broadcast_bucket_mb * 1024 * 1024)
+        # self._broadcast_bucket_bytes: int = int(broadcast_bucket_mb * 1024 * 1024)
 
         assert world_mesh['dense'] is not None, "DP mesh must be provided"
 
@@ -404,6 +404,8 @@ class MoEFusedV2Optimizer:
 
         # check
         device = None
+        has_bf16_param = False
+        has_fp32_param = False
         for param_group in param_groups:
             for i, (name, param) in enumerate(param_group['named_params'].items()):
                 if not param.requires_grad:
@@ -413,9 +415,21 @@ class MoEFusedV2Optimizer:
                 else:
                     assert device == param.device, "Inconsistent device found"
                 # float16 params:
-                assert param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor'], 'Only support 16 bit params. Received {}'.format(param.type())
+                if param.type() in ['torch.cuda.HalfTensor', 'torch.cuda.BFloat16Tensor']:
+                    has_bf16_param = True
+                elif param.type() in ['torch.cuda.FloatTensor']:
+                    has_fp32_param = True
 
-
+        if has_bf16_param and has_fp32_param:
+            raise ValueError("Mixed bf16 and fp32 parameters are not supported in MoEFusedV2Optimizer")
+        
+        if has_bf16_param:
+            # The model only has bf16 params
+            # The optimizer has to decide whether to maintain fp32 main params
+            self.should_maintain_fp32_main_param = True
+        else:
+            # The model has its own copy of fp32 main params
+            self.should_maintain_fp32_main_param = False
 
 
         self.states: Dict[str, DTensor] = OrderedDict()
@@ -433,9 +447,14 @@ class MoEFusedV2Optimizer:
                 num_elements = param.numel()
 
                 # main param
-                main_param = torch.zeros(num_elements, dtype=torch.float32, device=device) 
-                main_param = self._distribute_tensor(main_param, device_mesh)
-                self.states[f'{name}.main'] = main_param
+                if self.should_maintain_fp32_main_param:
+                    main_param = torch.zeros(num_elements, dtype=torch.float32, device=device) 
+                    main_param = self._distribute_tensor(main_param, device_mesh)
+                    self.states[f'{name}.main'] = main_param
+                else:
+                    assert param.dtype == torch.float32, "Expect fp32 param when should_maintain_fp32_main_param is False"
+                    # wrap in DTensor so it works with rest of the code
+                    self.states[f'{name}.main'] = DTensor.from_local(param.data.view(-1), device_mesh=device_mesh, placements=[Replicate()])
 
                 # exp avg
                 exp_avg = torch.zeros(num_elements, dtype=self.states_dtype, device=device)
@@ -457,15 +476,17 @@ class MoEFusedV2Optimizer:
                 self.states[f'{name}.step'] = step_tensor
 
         # copy model params to main params
-        for param_group in param_groups:
-            for name, param in param_group['named_params'].items():
-                main_param = self.states[f'{name}.main']
-                
-                assign_full_tensor_to_dtensor(dst=main_param, src=param.data.float().reshape(-1))
+        if self.should_maintain_fp32_main_param:
+            for param_group in param_groups:
+                for name, param in param_group['named_params'].items():
+                    main_param = self.states[f'{name}.main']
+                    
+                    assign_full_tensor_to_dtensor(dst=main_param, src=param.data.float().reshape(-1))
 
         self.param_groups = param_groups
 
-        self._check_model_param_main_param_the_same()
+        if self.should_maintain_fp32_main_param:
+            self._check_model_param_main_param_the_same()
 
         self.print_memory_summary()
 
@@ -742,7 +763,7 @@ class MoEFusedV2Optimizer:
         self._dealloc_main_grad()
         dbg_mem_before_cp2 = torch.cuda.memory_allocated()/1024**3
 
-        self._copy_main_params_to_model_params()
+        # self._copy_main_params_to_model_params()
 
         return None
 
@@ -885,6 +906,7 @@ class MoEFusedV2Optimizer:
 
     @nvtx.annotate("MoEFusedV2Optimizer._copy_main_params_to_model_param`s")
     def _copy_main_params_to_model_params(self):
+        assert False
         for param_group in self.param_groups:
             for name, param in param_group['named_params'].items():
                 main_param = self.states[f'{name}.main']
