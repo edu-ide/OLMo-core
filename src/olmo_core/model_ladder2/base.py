@@ -1,3 +1,4 @@
+import dataclasses
 import math
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
@@ -31,7 +32,7 @@ from olmo_core.train import (
     teardown_training_environment,
 )
 
-from .utils import format_tokens
+from .utils import format_count, format_tokens
 
 M = TypeVar("M", bound=Config)
 
@@ -75,7 +76,7 @@ class RunConfigurator(Config, metaclass=ABCMeta):
 
     @abstractmethod
     def configure_batch_size(self, num_params: int) -> int:
-        """Get the global batch size for a model of this size."""
+        """Get the global batch size in tokens for a model of this size."""
         raise NotImplementedError
 
     @abstractmethod
@@ -86,6 +87,19 @@ class RunConfigurator(Config, metaclass=ABCMeta):
     @abstractmethod
     def configure_lr_scheduler(self, num_params: int) -> Scheduler:
         """Get the learning rate scheduler for a model of this size."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def configure_checkpoint_intervals(self, num_params: int) -> list[tuple[Duration, str]]:
+        """
+        Get the checkpoint intervals for a model of this size.
+        Returns a list of (checkpoint interval, checkpoint description) tuples.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    def plot_lr_schedule(self, num_params: int, save_path: PathOrStr | None = None):
+        """Render a plot of the learning rate schedule."""
         raise NotImplementedError
 
 
@@ -190,13 +204,43 @@ class WSDSChinchillaRunConfigurator(RunConfigurator):
             period_lengths=period_lengths,
         )
 
-    def plot_lr_schedule(self, num_params: int):
-        import matplotlib.pyplot as plt  # type: ignore
-        import pandas as pd  # type: ignore
+    def configure_checkpoint_intervals(self, num_params: int) -> list[tuple[Duration, str]]:
+        # We save two checkpoints for each period. One right before the decay and one at the bottom
+        # of the decay (end of the period).
+        _, chinchilla_periods = self.configure_chinchilla_periods(num_params)
+        checkpoints: list[tuple[Duration, str]] = []
+        for pidx, c in enumerate(chinchilla_periods):
+            period = Duration.chinchilla_tokens(c, model_params=num_params)
+            period_length: int
+            if pidx == 0:
+                period_length = period.value
+            else:
+                period_length = (
+                    period.value
+                    - Duration.chinchilla_tokens(
+                        chinchilla_periods[pidx - 1], model_params=num_params
+                    ).value
+                )
+            pre_decay = dataclasses.replace(
+                period, value=int(period.value - period_length * self.decay_fraction)
+            )
+            checkpoints.append((pre_decay, f"Period {pidx+1}, {c}xC pre-decay"))
+            checkpoints.append((period, f"Period {pidx+1}, {c}xC post-decay"))
+        return checkpoints
+
+    def plot_lr_schedule(self, num_params: int, save_path: PathOrStr | None = None):
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+            import pandas as pd  # type: ignore
+        except ImportError as exc:
+            raise ImportError(
+                "matplotlib and pandas are required to use the plotting functionality."
+            ) from exc
 
         optim = self.configure_optimizer(num_params)
         scheduler = self.configure_lr_scheduler(num_params)
         warmup, chinchilla_periods = self.configure_chinchilla_periods(num_params)
+        checkpoint_intervals = self.configure_checkpoint_intervals(num_params)
         t_max = self.configure_duration(num_params).value
         batch_size = self.configure_batch_size(num_params)
         tokens_seen = 0
@@ -204,21 +248,19 @@ class WSDSChinchillaRunConfigurator(RunConfigurator):
         lrs = []
         while tokens_seen < t_max:
             tokens_seen += batch_size
-            lr = scheduler.get_lr(optim.lr, tokens_seen, t_max)
+            lr = float(scheduler.get_lr(optim.lr, tokens_seen, t_max))
             tokens.append(tokens_seen)
             lrs.append(lr)
 
-        df = pd.DataFrame({"tokens": tokens, "lr": lrs})
-        df.plot(x="tokens", y="lr", legend=False)
+        df = pd.DataFrame({"tokens": tokens, "LR": lrs})
+        df.plot(x="tokens", y="LR", legend=False, figsize=(12, 6))
         plt.grid(True)
 
         for c in chinchilla_periods:
-            if c > self.chinchilla_multiple:
-                break
             period = Duration.chinchilla_tokens(c, model_params=num_params).value
-            plt.axvline(x=period, color="red", linestyle="--", alpha=0.5, label=f"{c}xC")
+            plt.axvline(x=period, color="red", linestyle="--", alpha=0.5)
             plt.text(
-                period + warmup,
+                period,
                 0.0,
                 f"{c}xC",
                 color="red",
@@ -227,7 +269,16 @@ class WSDSChinchillaRunConfigurator(RunConfigurator):
                 rotation=45,
             )
 
-        plt.title(f"Learning rate schedule out to {self.chinchilla_multiple}xC")
+        plt.scatter(
+            [d.value for d, _ in checkpoint_intervals],
+            [float(scheduler.get_lr(optim.lr, d.value, t_max)) for d, _ in checkpoint_intervals],
+            color="green",
+            label="Checkpoint",
+        )
+
+        plt.title(
+            f"Learning rate schedule for {format_count(num_params)} model out to {self.chinchilla_multiple}xC"
+        )
 
         caption = (
             f"peak LR={optim.lr:.6f}, batch size={format_tokens(batch_size)}\n"
@@ -236,8 +287,13 @@ class WSDSChinchillaRunConfigurator(RunConfigurator):
         )
         plt.xlabel(f"Tokens\n\n{caption}")
 
+        plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left", borderaxespad=0.0)
         plt.tight_layout()
-        plt.show()
+
+        if save_path is not None:
+            plt.savefig(save_path)
+        else:
+            plt.show()
 
 
 @dataclass(kw_only=True)

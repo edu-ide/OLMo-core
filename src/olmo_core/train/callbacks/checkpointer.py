@@ -89,6 +89,16 @@ class CheckpointerCallback(Callback):
     The strategy for removing old checkpoints found in the save folder.
     """
 
+    ephemeral_cooldown: Optional[int] = None
+    """
+    The number of steps to wait after saving a checkpoint before another ephemeral one.
+    """
+
+    fixed_checkpoints: Optional[List[int]] = None
+    """
+    A list of fixed steps at which to save additional permanent checkpoints.
+    """
+
     enabled: bool = True
 
     # Bookkeeping
@@ -252,13 +262,26 @@ class CheckpointerCallback(Callback):
         if not self.checkpoint_pending:
             self._remove_old_checkpoints()
 
-        if self.step % self.save_interval == 0:
+        if self.fixed_checkpoints is not None and self.step in self.fixed_checkpoints:
+            # Save permanent checkpoint.
+            self._checkpoints.append(self._save_checkpoint())
+        elif self.step % self.save_interval == 0:
+            # Save permanent checkpoint.
             self._checkpoints.append(self._save_checkpoint())
         elif (
             self.ephemeral_save_interval is not None
             and self.step % self.ephemeral_save_interval == 0
         ):
+            # Maybe save ephemeral checkpoint.
+            if (
+                self.ephemeral_cooldown is not None
+                and (self.step - self._latest_checkpoint_step) < self.ephemeral_cooldown
+            ):
+                return
+
             self._ephemeral_checkpoints.append(self._save_checkpoint())
+
+            # Remove old ephemeral checkpoints.
             while len(self._ephemeral_checkpoints) > 1:
                 oldest_path = self._ephemeral_checkpoints.pop(0)
                 self._schedule_for_removal(oldest_path)
