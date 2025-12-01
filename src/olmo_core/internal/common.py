@@ -230,6 +230,8 @@ def build_launch_config(
             "mkdir -p ~/.aws",
             "printenv AWS_CONFIG > ~/.aws/config",
             "printenv AWS_CREDENTIALS > ~/.aws/credentials",
+            # Copy down checkpoint from R2.
+            "aws s3 cp --recursive --profile=R2 s3://olmo-checkpoints/ai2-llm/Olmo-3-1025-7B/stage1/step1000 checkpoint",
         ],
     )
 
