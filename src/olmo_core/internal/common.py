@@ -232,7 +232,7 @@ def build_launch_config(
             "printenv AWS_CREDENTIALS > ~/.aws/credentials",
             # Copy down checkpoint from R2.
             "pip install awscli",
-            "aws s3 cp --recursive --profile=R2 s3://olmo-checkpoints/ai2-llm/Olmo-3-1025-7B/stage1/step1000 checkpoint",
+            "aws s3 cp --recursive --profile=R2 --endpoint-url=$R2_ENDPOINT_URL s3://olmo-checkpoints/ai2-llm/Olmo-3-1025-7B/stage1/step1000 checkpoint",
         ],
     )
 
