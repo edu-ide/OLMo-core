@@ -907,12 +907,61 @@ class MoEFusedV2Optimizer:
 
     @nvtx.annotate("MoEFusedV2Optimizer._copy_main_params_to_model_param`s")
     def _copy_main_params_to_model_params(self):
+        LAUNCH_AG_THRESHOLD = 500_000_000  # X elements
         for param_group in self.param_groups:
+
+            # initialize for coalesced all_gather
+            input_dtensors = []
+            output_params = []
+            input_numel = 0
+
+            def flush_all_gather():
+                nonlocal input_dtensors, output_params, input_numel
+                # ref_out = []
+                # for t in input_dtensors:
+                #     ref_out.append(t.full_tensor())
+                if len(input_dtensors) == 0:
+                    return
+                pg = input_dtensors[0].device_mesh.get_group()
+                input_locals = [ t.to_local() for t in input_dtensors]
+                gathered = coalesced_all_gather(input_locals, pg)
+
+                for gatherd_tensor, out_param in zip(gathered, output_params):
+                    out_param.data.copy_(gatherd_tensor.reshape(out_param.data.shape))
+
+                gathered.clear()
+                output_params.clear()
+                input_dtensors.clear()
+                input_numel = 0
+
             for name, param in param_group['named_params'].items():
+                
+
                 main_param = self.states[f'{name}.main']
-                # get global tensor from DTensor
-                main_param_full = main_param.full_tensor().reshape(param.data.shape) # NOTE: collective ops
-                param.data.copy_(main_param_full.to(param.data.dtype))
+                if not any(isinstance(p, Shard) for p in main_param.placements):
+                    # replicated tensor, directly get full tensor
+                    main_param_full = main_param.full_tensor().reshape(param.data.shape)
+                    param.data.copy_(main_param_full.to(param.data.dtype))
+                    continue
+
+                # check for process group
+                if len(input_dtensors) > 0:
+                    main_param.device_mesh == input_dtensors[0].device_mesh
+
+                input_dtensors.append(main_param)
+                output_params.append(param)
+                input_numel += main_param.numel()
+
+                if input_numel >= LAUNCH_AG_THRESHOLD:
+                    flush_all_gather()
+
+            # final gather
+            if len(input_dtensors) > 0:
+                flush_all_gather()
+
+        return
+
+
 
     def _dealloc_main_grad(self):
         self.main_grad.clear()
@@ -1167,3 +1216,70 @@ class MoEFusedV2Optimizer:
         raise NotImplementedError()
 
 
+from typing import List, Optional
+import torch
+import torch.distributed as dist
+
+
+def coalesced_all_gather(
+    input_tensors: List[torch.Tensor],
+    process_group: dist.ProcessGroup,
+) -> List[torch.Tensor]:
+    """
+    Coalesced all_gather for a list of 1-D tensors.
+
+    Args:
+        input_tensors: List of 1-D tensors. For a given index i, all ranks must
+            have input_tensors[i] with the same numel, dtype, and device.
+        process_group: The process group to use for all_gather (default: world group).
+
+    Returns:
+        A list of tensors, one per input tensor.
+        For input_tensors[i] of shape [N_i], the output[i] has shape [world_size, N_i],
+        where output[i][r] is the data from rank r.
+    """
+    if not input_tensors:
+        return []
+
+    # Basic sanity checks
+    device = input_tensors[0].device
+    dtype = input_tensors[0].dtype
+    for t in input_tensors:
+        assert t.dim() == 1, "All input_tensors must be 1-D"
+        assert t.device == device, "All input_tensors must be on the same device"
+        assert t.dtype == dtype, "All input_tensors must have the same dtype"
+
+    world_size = dist.get_world_size(process_group)
+
+    # 1) Build flat local buffer
+    sizes = [t.numel() for t in input_tensors]
+    offsets = []
+    running = 0
+    for s in sizes:
+        offsets.append(running)
+        running += s
+    total_elems = running
+
+    flat_local = torch.empty(total_elems, device=device, dtype=dtype)
+    for t, off in zip(input_tensors, offsets):
+        flat_local[off : off + t.numel()] = t.view(-1)
+
+    # 2) Single all_gather on flat buffer
+    # Shape: [world_size, total_elems], but we expose it as a list to all_gather
+    flat_global = torch.empty(world_size, total_elems, device=device, dtype=dtype)
+    output_slices = list(flat_global.unbind(0))  # list of [total_elems] views
+
+    dist.all_gather(
+        output_slices,
+        flat_local,
+        group=process_group,
+    )
+
+    # 3) Unpack into per-tensor gathered outputs
+    gathered_outputs: List[torch.Tensor] = []
+    for size, off in zip(sizes, offsets):
+        # [world_size, size]
+        gathered = flat_global[:, off : off + size].contiguous()
+        gathered_outputs.append(gathered)
+
+    return gathered_outputs
