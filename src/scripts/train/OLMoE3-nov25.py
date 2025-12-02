@@ -88,7 +88,7 @@ def _get_split_points(original_num_layers: int, num_stages: int, minus_last_stag
 SEQUENCE_LENGTH = 8192
 
 # GLOBAL_BATCH_SIZE_SEQ=1024 + 512
-GLOBAL_BATCH_SIZE_SEQ=32 * (32)
+GLOBAL_BATCH_SIZE_SEQ=32 * (1)
 GLOBAL_BATCH_SIZE = (
     (GLOBAL_BATCH_SIZE_SEQ) * SEQUENCE_LENGTH
 )  
@@ -96,7 +96,7 @@ GLOBAL_BATCH_SIZE = (
 GLOBAL_BATCH_TOKENS_IN_M = SEQUENCE_LENGTH * GLOBAL_BATCH_SIZE_SEQ // 1024 // 1024
 
 MAX_DURATION = int(2000e9)  # int(6e12), don't forget to adjust the LR when you increase this
-EVAL_INTERVAL = 50
+EVAL_INTERVAL = 5
 LR= 3e-4
 
 NUM_EXPERTS = 64
@@ -124,7 +124,7 @@ EP_DIM=8
 PP_DIM=1
 
 
-NUM_LAYERS=32
+NUM_LAYERS=8
 
 if PP_DIM > 1:
     MINUS_LAST_STAGE=1
@@ -136,7 +136,7 @@ else:
 
 
 # SPLIT_POINTS = None
-USE_COMPILE=True
+USE_COMPILE=False
 USE_AC=False
 USE_TBO=False
 GRAD_ACC_IN_FP32=False
@@ -413,7 +413,7 @@ def build_trainer_config(common: CommonComponents) -> TrainerConfig:
         # )
         .with_callback(
             "profiler", 
-            NvidiaProfilerCallback(enabled=True, # NOTE: change this
+            NvidiaProfilerCallback(enabled=False, # NOTE: change this
                                    profile_ranks=list(range(0, 8*128, 8)),
                                    start=21,
                                    end=24
@@ -421,7 +421,7 @@ def build_trainer_config(common: CommonComponents) -> TrainerConfig:
         )
         .with_callback(
             "torch_mem_history",
-            TorchMemoryHistoryCallback(enabled=True, # NOTE: change this
+            TorchMemoryHistoryCallback(enabled=False, # NOTE: change this
                                    profile_ranks=list(range(0, 8*128, 8)),
                                    start=11,
                                    end=14,
