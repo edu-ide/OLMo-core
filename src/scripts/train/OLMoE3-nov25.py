@@ -99,7 +99,7 @@ MAX_DURATION = int(1000e9)  # int(6e12), don't forget to adjust the LR when you 
 EVAL_INTERVAL = 50
 LR= 3e-4
 
-NUM_EXPERTS = 16
+NUM_EXPERTS = 32
 TOP_K = 4
 # D_MODEL=3072
 # D_ATTN=3072
@@ -413,7 +413,7 @@ def build_trainer_config(common: CommonComponents) -> TrainerConfig:
         # )
         .with_callback(
             "profiler", 
-            NvidiaProfilerCallback(enabled=False, # NOTE: change this
+            NvidiaProfilerCallback(enabled=True, # NOTE: change this
                                    profile_ranks=list(range(0, 8*128, 8)),
                                    start=21,
                                    end=24
