@@ -307,12 +307,14 @@ class MoEFusedV2Transformer(olmo_core.nn.transformer.Transformer):
 
         self._ep_modules = [m for m in self.modules() if getattr(m, '_ep_sharded', False) ] # collect the ep sharded part based on `_ep_sharded` field (will be set to True in `apply_ep`)
         replicate(self, device_mesh=dp_mesh, bucket_cap_mb=100, ignored_modules=self._ep_modules, gradient_as_bucket_view=True, 
-                    mixed_precision=mixed_precision
+                    # mixed_precision=mixed_precision
                   ) # dense ddp
 
         ep_dp_mesh = ep_mesh['ep_dp']
         for m in self._ep_modules:
-            replicate(m, device_mesh=ep_dp_mesh, bucket_cap_mb=100, gradient_as_bucket_view=True, mixed_precision=mixed_precision) # moe ddp
+            replicate(m, device_mesh=ep_dp_mesh, bucket_cap_mb=100, gradient_as_bucket_view=True, 
+                    #   mixed_precision=mixed_precision
+                      ) # moe ddp
         # Some inputs need to be on CPU initially, but DDP will move everything to model's
         # device if we don't hide it.
         from ...transformer.model import _hide_cpu_inputs_from_torch, _unhide_cpu_inputs_from_torch

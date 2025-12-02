@@ -763,7 +763,7 @@ class MoEFusedV2Optimizer:
         self._dealloc_main_grad()
         dbg_mem_before_cp2 = torch.cuda.memory_allocated()/1024**3
 
-        # self._copy_main_params_to_model_params()
+        self._copy_main_params_to_model_params()
 
         return None
 
@@ -881,7 +881,8 @@ class MoEFusedV2Optimizer:
                         # continue
 
                     # model's grad is in bf16, need to convert to fp32 for reduce-scatter
-                    model_grad_fp32 = param.grad.detach().view(-1).float() # unsharded local shape, FP32
+                    # model_grad_fp32 = param.grad.detach().view(-1).float() # unsharded local shape, FP32
+                    model_grad_fp32 = param.grad.detach().view(-1) # unsharded local shape, BF16. It should be a view of the reducer bucket
 
                 # release model grad to save memory
                 if self.model_has_grad_accum_fp32_buffer:
@@ -906,7 +907,6 @@ class MoEFusedV2Optimizer:
 
     @nvtx.annotate("MoEFusedV2Optimizer._copy_main_params_to_model_param`s")
     def _copy_main_params_to_model_params(self):
-        assert False
         for param_group in self.param_groups:
             for name, param in param_group['named_params'].items():
                 main_param = self.states[f'{name}.main']
@@ -1019,9 +1019,10 @@ class MoEFusedV2Optimizer:
             for name, model_p in group["named_params"].items():
                 if not model_p.requires_grad:
                     continue
-
+                
+                # in adam step(), make everything local and fp32 
                 main_params.append(self.states[f"{name}.main"].to_local())
-                grads.append(self.main_grad[name].to_local())
+                grads.append(self.main_grad[name].to_local().float()) 
                 if self.states_dtype == torch.bfloat16:
                     # new fp32 copy
                     exp_avgs.append(self.states[f"{name}.exp_avg"].to_local().to(torch.float32))
