@@ -88,7 +88,7 @@ def _get_split_points(original_num_layers: int, num_stages: int, minus_last_stag
 SEQUENCE_LENGTH = 8192
 
 # GLOBAL_BATCH_SIZE_SEQ=1024 + 512
-GLOBAL_BATCH_SIZE_SEQ=32 * (32)
+GLOBAL_BATCH_SIZE_SEQ=32 * (64)
 GLOBAL_BATCH_SIZE = (
     (GLOBAL_BATCH_SIZE_SEQ) * SEQUENCE_LENGTH
 )  
@@ -124,7 +124,7 @@ EP_DIM=8
 PP_DIM=1
 
 
-NUM_LAYERS=8
+NUM_LAYERS=16
 
 if PP_DIM > 1:
     MINUS_LAST_STAGE=1
