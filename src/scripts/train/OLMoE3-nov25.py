@@ -88,7 +88,7 @@ def _get_split_points(original_num_layers: int, num_stages: int, minus_last_stag
 SEQUENCE_LENGTH = 8192
 
 # GLOBAL_BATCH_SIZE_SEQ=1024 + 512
-GLOBAL_BATCH_SIZE_SEQ=32 * (128)
+GLOBAL_BATCH_SIZE_SEQ=32 * (128 + 64)
 GLOBAL_BATCH_SIZE = (
     (GLOBAL_BATCH_SIZE_SEQ) * SEQUENCE_LENGTH
 )  
@@ -96,10 +96,10 @@ GLOBAL_BATCH_SIZE = (
 GLOBAL_BATCH_TOKENS_IN_M = SEQUENCE_LENGTH * GLOBAL_BATCH_SIZE_SEQ // 1024 // 1024
 
 MAX_DURATION = int(1000e9)  # int(6e12), don't forget to adjust the LR when you increase this
-EVAL_INTERVAL = 10
+EVAL_INTERVAL = 50
 LR= 3e-4
 
-NUM_EXPERTS = 16
+NUM_EXPERTS = 64
 TOP_K = 4
 # D_MODEL=3072
 # D_ATTN=3072
@@ -359,7 +359,7 @@ def build_train_module_config(common: CommonComponents) -> MoEV2TransformerTrain
     )
 
 # WORK_DIR = "/jfs/tianhua-tao/ws-olmoe"
-WORK_DIR = "/weka/oe-training-default/tianhua/ws-megatron"
+# WORK_DIR = "/weka/oe-training-default/tianhua/ws-megatron"
 
 def build_trainer_config(common: CommonComponents) -> TrainerConfig:
     cancel_check_interval = 10
