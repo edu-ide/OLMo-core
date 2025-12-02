@@ -133,7 +133,7 @@ class RoutedExperts(nn.Module):
 
         # self.checkpoint_act_and_down = False
 
-    @torch.compiler.disable
+    @torch.compiler.disable(recursive=False)
     @nvtx.annotate("RoutedExperts.forward", color="blue")
     def forward(self, x: torch.Tensor, batch_size_per_expert: torch.Tensor) -> torch.Tensor:
         """
@@ -155,20 +155,20 @@ class RoutedExperts(nn.Module):
         
         w_up_gate = self.w_up_gate # (E, H, 2D)
         w_down = self.w_down # (E, H, D)
-        use_matmuls = False
-        if self.num_local_experts == 1 and use_matmuls:
-            up_gate = torch.matmul(x, w_up_gate.squeeze(0).t())  # -> (BS, 2H)
-        else:
-            up_gate = gmm_no_compile(x, w_up_gate, batch_size_per_expert_tensor, trans_b=True) # -> (BS, 2H)
+        # use_matmuls = False
+        # if self.num_local_experts == 1 and use_matmuls:
+        #     up_gate = torch.matmul(x, w_up_gate.squeeze(0).t())  # -> (BS, 2H)
+        # else:
+        up_gate = gmm_no_compile(x, w_up_gate, batch_size_per_expert_tensor, trans_b=True) # -> (BS, 2H)
 
         up_gate = cast(torch.Tensor, up_gate)  # ensure type is Tensor
 
         h = self.chunk_and_activate(up_gate) # -> (BS, H)
         
-        if self.num_local_experts == 1 and use_matmuls:
-            down = torch.matmul(h, w_down.squeeze(0))  # -> (BS, H)
-        else:
-            down = gmm_no_compile(h, w_down, batch_size_per_expert_tensor, trans_b=False) # -> (BS, H)
+        # if self.num_local_experts == 1 and use_matmuls:
+        #     down = torch.matmul(h, w_down.squeeze(0))  # -> (BS, H)
+        # else:
+        down = gmm_no_compile(h, w_down, batch_size_per_expert_tensor, trans_b=False) # -> (BS, H)
 
         return cast(torch.Tensor, down)  # ensure type is Tensor
 

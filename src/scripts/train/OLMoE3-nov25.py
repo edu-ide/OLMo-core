@@ -96,7 +96,7 @@ GLOBAL_BATCH_SIZE = (
 GLOBAL_BATCH_TOKENS_IN_M = SEQUENCE_LENGTH * GLOBAL_BATCH_SIZE_SEQ // 1024 // 1024
 
 MAX_DURATION = int(2000e9)  # int(6e12), don't forget to adjust the LR when you increase this
-EVAL_INTERVAL = 5
+EVAL_INTERVAL = 20
 LR= 3e-4
 
 NUM_EXPERTS = 64
