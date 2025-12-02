@@ -88,14 +88,14 @@ def _get_split_points(original_num_layers: int, num_stages: int, minus_last_stag
 SEQUENCE_LENGTH = 8192
 
 # GLOBAL_BATCH_SIZE_SEQ=1024 + 512
-GLOBAL_BATCH_SIZE_SEQ=32 * (128 + 64)
+GLOBAL_BATCH_SIZE_SEQ=32 * (32)
 GLOBAL_BATCH_SIZE = (
     (GLOBAL_BATCH_SIZE_SEQ) * SEQUENCE_LENGTH
 )  
 
 GLOBAL_BATCH_TOKENS_IN_M = SEQUENCE_LENGTH * GLOBAL_BATCH_SIZE_SEQ // 1024 // 1024
 
-MAX_DURATION = int(1000e9)  # int(6e12), don't forget to adjust the LR when you increase this
+MAX_DURATION = int(2000e9)  # int(6e12), don't forget to adjust the LR when you increase this
 EVAL_INTERVAL = 50
 LR= 3e-4
 
