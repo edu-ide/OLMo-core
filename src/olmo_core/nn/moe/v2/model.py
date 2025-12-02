@@ -752,7 +752,7 @@ class MoEFusedV2Transformer(olmo_core.nn.transformer.Transformer):
                         **all_block_kwargs, 
                         **block_kwargs, 
                         use_reentrant=False, 
-                        context_fn=recompute_context_fn
+                        # context_fn=recompute_context_fn
                     )
                     h = cast(torch.Tensor, h)
                 else:
@@ -761,13 +761,13 @@ class MoEFusedV2Transformer(olmo_core.nn.transformer.Transformer):
         return h
 
     def _forwrad_one_block(self, h, block_key: str, **block_kwargs: Dict[str, Any]) -> torch.Tensor:
-        debug_mem_block_start = torch.cuda.memory_allocated()/1024**3
+        # debug_mem_block_start = torch.cuda.memory_allocated()/1024**3
         block = self.blocks[block_key]
         h = block(h, **block_kwargs)
 
-        debug_mem_block_end = torch.cuda.memory_allocated()/1024**3
+        # debug_mem_block_end = torch.cuda.memory_allocated()/1024**3
 
-        mem_diff = debug_mem_block_end - debug_mem_block_start
+        # mem_diff = debug_mem_block_end - debug_mem_block_start
         # if block.block_idx == 1:
         #     print(f'block mem: {mem_diff:.3f} GB')
         # print(f'block {block_key} mem: {mem_diff:.3f} GB')
