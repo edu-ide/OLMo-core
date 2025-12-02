@@ -136,7 +136,7 @@ else:
 
 
 # SPLIT_POINTS = None
-USE_COMPILE=False
+USE_COMPILE=True
 USE_AC=False
 USE_TBO=False
 GRAD_ACC_IN_FP32=False
