@@ -1,3 +1,4 @@
+import logging
 import typing
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ from olmo_core.train import (
     teardown_training_environment,
 )
 from olmo_core.train.train_module import TrainModule
+
+log = logging.getLogger(__name__)
 
 
 class DeviceMeshSpec(NamedTuple):
@@ -179,10 +182,47 @@ class ModelLadder(Config):
     def work_dir(self) -> PathOrStr:
         return "./cache" if io.is_url(self.dir) else str(io.join_path(self.dir, "cache"))
 
-    def run(self, size_spec: str):
+    def dry_run(self, size_spec: str):
+        if size_spec not in self.sizes:
+            raise ValueError(f"Invalid size_spec '{size_spec}', must be one of {self.sizes}")
+
+        num_params = self.get_num_params(size_spec)
+
+        # Configure global batch size, make sure request number of devices matches the number
+        # of devices available.
+        target_global_batch_size = self.run_configurator.configure_target_batch_size(num_params)
+        (
+            global_batch_size,
+            device_microbatch_size,
+            requested_devices,
+            dp_world_size,
+        ) = self._configure_batch_size_and_num_devices(size_spec, num_params)
+        assert device_microbatch_size % self.sequence_length == 0
+        assert global_batch_size % device_microbatch_size == 0
+        assert global_batch_size % self.sequence_length == 0
+        assert device_microbatch_size % self.sequence_length == 0
+        assert global_batch_size % (device_microbatch_size * dp_world_size) == 0
+        num_grad_accum_steps = global_batch_size // (device_microbatch_size * dp_world_size)
+
+        log.info(
+            f"Dry run for model size {size_spec}:\n"
+            f" ❯ Target batch size is {target_global_batch_size:,d} tokens\n"
+            f" ❯ Actual batch size is {global_batch_size:,d} tokens "
+            f"({global_batch_size // self.sequence_length:,d} instances)\n"
+            f" ❯ Micro-batch per device size is {device_microbatch_size:,d} tokens "
+            f"({device_microbatch_size // self.sequence_length} instances) with {num_grad_accum_steps:,d} grad accumulation steps\n"
+            f" ❯ Requires {requested_devices} out of {self.max_devices} devices, "
+            f"with a data-parallel world size of {dp_world_size:,d}"
+        )
+        log.info("Plotting LR schedule...")
+        self.run_configurator.plot_lr_schedule(num_params, batch_size=global_batch_size)
+
+    def run(self, size_spec: str, for_benchmarking: bool = False):
         """
         Execute a particular model run of the experiment locally and store the results.
         """
+        if size_spec not in self.sizes:
+            raise ValueError(f"Invalid size_spec '{size_spec}', must be one of {self.sizes}")
         prepare_training_environment(seed=self.seed, backend=self.backend)
         set_composable_seed(self.seed)
 
@@ -201,6 +241,7 @@ class ModelLadder(Config):
             global_batch_size,
             device_microbatch_size,
             requested_devices,
+            _,
         ) = self._configure_batch_size_and_num_devices(size_spec, num_params)
         if requested_devices != dist_utils.get_world_size():
             raise OLMoConfigurationError(
@@ -213,7 +254,9 @@ class ModelLadder(Config):
         scheduler = self.run_configurator.configure_lr_scheduler(num_params)
 
         # Configure trainer.
-        trainer_config = self._configure_trainer(size_spec, num_params, global_batch_size)
+        trainer_config = self._configure_trainer(
+            size_spec, num_params, global_batch_size, for_benchmarking=for_benchmarking
+        )
 
         # Build instance sources and data loader.
         instance_sources = [
@@ -264,17 +307,29 @@ class ModelLadder(Config):
 
         teardown_training_environment()
 
-    @abstractmethod
-    def get_metrics_for_run(self, size_spec: str) -> dict[str, float] | None:
-        """
-        Retrieve the final metrics for a particular model run of the experiment.
-        If the experiment hasn't completed this should return ``None``.
-        """
-        raise NotImplementedError
+    def run_benchmark(self, size_spec: str):
+        self.run(size_spec, for_benchmarking=True)
+
+    def get_num_params(self, size_spec: str):
+        """Get the actual number of non-embedding parameters for a model of the given size spec."""
+        model_config = self.model_configurator.configure_model(
+            size_spec=size_spec,
+            sequence_length=self.sequence_length,
+            tokenizer=self.tokenizer,
+            device_type=self.device_type,
+        )
+        return model_config.num_non_embedding_params
+
+    def get_num_devices_for_run(self, size_spec: str) -> int:
+        """Get the number of devices that would be used for a run of the given size spec."""
+        _, _, num_devices, _ = self._configure_batch_size_and_num_devices(
+            size_spec, self.get_num_params(size_spec)
+        )
+        return num_devices
 
     def _configure_batch_size_and_num_devices(
         self, size_spec: str, num_params: int
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int, int, int]:
         # Configure global batch size and device micro-batch size.
         global_batch_size = self.run_configurator.configure_target_batch_size(num_params)
         device_microbatch_size = self.model_configurator.configure_device_microbatch_size(
@@ -320,10 +375,20 @@ class ModelLadder(Config):
         max_num_grad_accum_steps = global_batch_size // gbz_factor
         expansion_factor = min(self.max_devices // min_world_size, max_num_grad_accum_steps)
         num_devices = min_world_size * expansion_factor
-        return global_batch_size, device_microbatch_size, num_devices
+        dp_world_size = min_dp_world_size * expansion_factor
+
+        # Finally we ensure `global_batch_size` is divisible by the micro-batch size.
+        microbatch_size = device_microbatch_size * dp_world_size
+        global_batch_size = round(global_batch_size / microbatch_size) * microbatch_size
+
+        return global_batch_size, device_microbatch_size, num_devices, dp_world_size
 
     def _configure_trainer(
-        self, size_spec: str, num_params: int, global_batch_size: int
+        self,
+        size_spec: str,
+        num_params: int,
+        global_batch_size: int,
+        for_benchmarking: bool = False,
     ) -> TrainerConfig:
         run_name = f"{self.name}-{size_spec}"
         save_folder = io.join_path(self.dir, size_spec)
@@ -351,6 +416,9 @@ class ModelLadder(Config):
             metrics_collect_interval=10,
             cancel_check_interval=10,
             max_duration=duration,
+            hard_stop=Duration.steps(100) if for_benchmarking else None,
+            no_checkpoints=for_benchmarking,
+            no_evals=for_benchmarking,
             callbacks={
                 "gpu_monitor": callbacks.GPUMemoryMonitorCallback(),
                 "config_saver": callbacks.ConfigSaverCallback(),
@@ -361,8 +429,9 @@ class ModelLadder(Config):
                     save_interval=None,
                     save_async=True,
                     fixed_steps=checkpoint_interval_steps,
+                    enabled=not for_benchmarking,
                 ),
-                "profiler": callbacks.ProfilerCallback(enabled=False),
+                "profiler": callbacks.ProfilerCallback(enabled=for_benchmarking),
                 "gap_monitor": callbacks.GAPMonitorCallback(enabled=False),
                 "slack_notifier": callbacks.SlackNotifierCallback(name=run_name, enabled=False),
                 "beaker": callbacks.BeakerCallback(enabled=False),
@@ -371,16 +440,19 @@ class ModelLadder(Config):
                     group=run_name,
                     project=self.name,
                     cancel_check_interval=10,
+                    enabled=not for_benchmarking,
                 ),
                 "downstream_evaluator": callbacks.DownstreamEvaluatorCallbackConfig(
                     tokenizer=self.tokenizer,
                     tasks=self._get_in_loop_eval_tasks(),
                     eval_interval=None,
                     fixed_steps=checkpoint_interval_steps,
+                    enabled=not for_benchmarking,
                 ),
                 "metric_saver": callbacks.MetricSaverCallback(
                     metrics_to_capture=["train/*", "optim/*", "eval/*"],
                     fixed_steps=checkpoint_interval_steps,
+                    enabled=not for_benchmarking,
                 ),
             },
         )

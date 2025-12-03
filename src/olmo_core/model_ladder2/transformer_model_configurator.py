@@ -164,7 +164,7 @@ class TransformerModelConfigurator(ModelConfigurator[TransformerConfig]):
         size_spec = TransformerSize(size_spec)
 
         dp_config = TransformerDataParallelConfig(
-            name=DataParallelType.hsdp,
+            name=DataParallelType.fsdp,
             param_dtype=DType.bfloat16,
             reduce_dtype=DType.float32,
             wrapping_strategy=TransformerDataParallelWrappingStrategy.blocks,
