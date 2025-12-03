@@ -193,8 +193,8 @@ class WSDSChinchillaRunConfigurator(RunConfigurator):
 
         caption = (
             f"peak LR={optim.lr:.6f}, batch size={format_tokens(batch_size)}\n"
-            f"warmup={format_tokens(warmup)}={warmup // batch_size:,d} steps, "
-            f"duration={format_tokens(t_max)}={t_max // batch_size:,d} steps"
+            f"warmup={format_tokens(warmup)} / {warmup // batch_size:,d} steps, "
+            f"duration={format_tokens(t_max)} / {t_max // batch_size:,d} steps"
         )
         plt.xlabel(f"Tokens\n\n{caption}")
 
