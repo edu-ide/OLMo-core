@@ -173,6 +173,7 @@ def configure_launcher(
         workspace=args.workspace,
         beaker_image=args.beaker_image,
         budget=args.budget,
+        nccl_debug="VERSION",
     )
     if num_gpus < 8:
         launch_config.num_gpus = num_gpus
