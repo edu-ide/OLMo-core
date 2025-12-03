@@ -1,73 +1,106 @@
-import dataclasses
-import math
+import typing
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
-from typing import ClassVar, Generic, TypeVar
+from typing import Generic, NamedTuple, TypeVar
 
+import olmo_core.distributed.utils as dist_utils
 import olmo_core.io as io
 import olmo_core.train.callbacks as callbacks
 from olmo_core.aliases import PathOrStr
 from olmo_core.config import Config
-from olmo_core.data import (
-    DataMix,
-    InstanceFilterConfig,
-    NumpyDataLoaderConfig,
-    NumpyFSLDatasetConfig,
-    TokenizerConfig,
+from olmo_core.data import TokenizerConfig
+from olmo_core.data.composable import (
+    ComposableDataLoaderConfig,
+    InstanceSourceConfig,
+    set_composable_seed,
 )
 from olmo_core.exceptions import OLMoConfigurationError
-from olmo_core.nn.transformer import TransformerConfig
-from olmo_core.optim import (
-    WSDS,
-    OptimConfig,
-    OptimGroupOverride,
-    Scheduler,
-    SchedulerUnits,
-    SkipStepAdamWConfig,
-)
+from olmo_core.nn.config import ModelConfig
+from olmo_core.optim import OptimConfig, Scheduler
 from olmo_core.train import (
     Duration,
+    DurationUnit,
     TrainerConfig,
     prepare_training_environment,
     teardown_training_environment,
 )
+from olmo_core.train.train_module import TrainModule
 
-from .utils import format_count, format_tokens
 
-M = TypeVar("M", bound=Config)
+class DeviceMeshSpec(NamedTuple):
+    world_size: int
+    """The mininum numbers of devices required."""
+    dp_world_size: int | None
+    """
+    The mininum size of the data parallel group. This can be set to ``None`` if the data parallel
+    world size should equal the world size.
+    """
+
+
+M = TypeVar("M", bound=ModelConfig)
 
 
 @dataclass(kw_only=True)
-class ModelConfigurator(Config, metaclass=ABCMeta):
+class ModelConfigurator(Config, Generic[M], metaclass=ABCMeta):
     """
     Defines how to configure a model of a particular size.
     """
 
     @abstractmethod
-    def configure_model(self, size: str) -> TransformerConfig:
-        """
-        Configure the model for the given size spec.
-        """
+    def configure_model(
+        self,
+        *,
+        size_spec: str,
+        sequence_length: int,
+        tokenizer: TokenizerConfig,
+        device_type: str,
+    ) -> M:
+        """Configure the model for the given size spec."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def configure_device_microbatch_size(
+        self,
+        *,
+        size_spec: str,
+        sequence_length: int,
+        device_type: str,
+    ) -> int:
+        """Configure the training microbatch per-device size in tokens for the given size spec."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def configure_minimal_device_mesh_spec(
+        self,
+        *,
+        size_spec: str,
+        sequence_length: int,
+        device_type: str,
+    ) -> DeviceMeshSpec:
+        """Configure the minimal device mesh spec needed to execute a run for model of this size."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def build_train_module(
+        self,
+        *,
+        size_spec: str,
+        sequence_length: int,
+        device_microbatch_size: int,
+        model_config: M,
+        optim_config: OptimConfig,
+        scheduler: Scheduler,
+        device_type: str,
+    ) -> TrainModule:
+        """Build the train module for the given model and optimizer configs."""
         raise NotImplementedError
 
 
 @dataclass(kw_only=True)
 class RunConfigurator(Config, metaclass=ABCMeta):
     """
-    Defines how to configure a run for a model of particular size.
+    Defines how to configure a run for a model of a particular size.
     """
-
-    max_devices: int
-    sequence_length: int
-
-    @property
-    @abstractmethod
-    def fingerprint(self) -> str:
-        """
-        A unique fingerprint for this run configuration. Used for caching run results.
-        Ideally human readable.
-        """
-        raise NotImplementedError
 
     @abstractmethod
     def configure_duration(self, num_params: int) -> Duration:
@@ -75,8 +108,12 @@ class RunConfigurator(Config, metaclass=ABCMeta):
         raise NotImplementedError
 
     @abstractmethod
-    def configure_batch_size(self, num_params: int) -> int:
-        """Get the global batch size in tokens for a model of this size."""
+    def configure_target_batch_size(self, num_params: int) -> int:
+        """
+        Get the target global batch size in tokens for a model of this size.
+        The actual batch size used may be slightly different to ensure it's a multiple of
+        the data parallel world size times the device micro-batch size.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -98,301 +135,215 @@ class RunConfigurator(Config, metaclass=ABCMeta):
         raise NotImplementedError
 
     @abstractmethod
-    def plot_lr_schedule(self, num_params: int, save_path: PathOrStr | None = None):
+    def plot_lr_schedule(
+        self, num_params: int, *, batch_size: int | None = None, save_path: PathOrStr | None = None
+    ):
         """Render a plot of the learning rate schedule."""
         raise NotImplementedError
 
 
 @dataclass(kw_only=True)
-class WSDSChinchillaRunConfigurator(RunConfigurator):
-    """
-    A run configurator that uses WSD-S learning rate scheduling and Chinchilla scaling laws.
-    """
-
-    VERSION: ClassVar[int] = 1
-
-    chinchilla_multiple: float
-    """
-    How long to train each run for, expressed as a multiple of the Chinchilla-optimal duration
-    which must be a power of 2.
-    """
-    decay_fraction: float = 0.1
-    """The duration of each decay as a fraction of the period. Must be at least 10%."""
-
-    def __post_init__(self):
-        if self.max_devices <= 0 or not math.log(self.max_devices, 2).is_integer():
-            raise OLMoConfigurationError("'max_devices' must be positive power of 2")
-        if self.sequence_length <= 0 or not math.log(self.sequence_length, 2).is_integer():
-            raise OLMoConfigurationError("'sequence_length' must be positive power of 2")
-        if self.chinchilla_multiple < 0.5 or not math.log(self.chinchilla_multiple, 2).is_integer():
-            raise OLMoConfigurationError(
-                "'chinchilla_multiple' must be at least 0.5 and a power of 2"
-            )
-        if not (0 < self.decay_fraction < 0.5):
-            raise OLMoConfigurationError(
-                "'decay_fraction' must be greater than 0.0 and less than 0.5"
-            )
-
-    @property
-    def fingerprint(self) -> str:
-        return f"WSD-S_{self.decay_fraction}DF_{self.max_devices}GPUs_{self.sequence_length}CL_v{self.VERSION}"
-
-    def configure_duration(self, num_params: int) -> Duration:
-        return Duration.chinchilla_tokens(
-            self.chinchilla_multiple,
-            model_params=num_params,
-        )
-
-    def configure_batch_size(self, num_params: int) -> int:
-        # Calculate global batch size according to https://api.semanticscholar.org/CorpusID:270764838
-        # which assumes a sequence length of 2048.
-        batch_size = round(2048 * 160 * (num_params / 108_000_000) ** (2 / 3))
-        # Make sure it's a multiple of 'sequence_length x max_devices'.
-        factor = self.sequence_length * self.max_devices
-        return round(batch_size / factor) * factor
-
-    def configure_optimizer(self, num_params: int) -> SkipStepAdamWConfig:
-        # Calculate LR according to https://api.semanticscholar.org/CorpusID:270764838
-        # but divide by 2 for WSD schedule (seems to work emperically).
-        lr = 0.0047 * (num_params / 108_000_000) ** (-1 / 3)
-        lr /= 2.0
-        return SkipStepAdamWConfig(
-            lr=lr,
-            weight_decay=0.1,
-            betas=(
-                0.9,
-                0.95,  # NOTE: paper above suggest using larger beta2 (~0.99) for small batch sizes.
-            ),
-            group_overrides=[
-                OptimGroupOverride(params=["embeddings.weight"], opts=dict(weight_decay=0.0))
-            ],
-        )
-
-    def configure_chinchilla_periods(self, num_params: int) -> tuple[int, list[float]]:
-        # Warm up 1 token per parameter according to https://api.semanticscholar.org/CorpusID:270764838
-        warmup = num_params
-
-        # Generate Chinchilla (decay) periods as multiples of two, but at least the minimum.
-        chinchilla_periods: list[float] = []
-        max_pow = math.log(self.chinchilla_multiple, 2)
-        assert max_pow.is_integer()  # checked in `__post_init__()` as well.
-        for p in range(-1, int(max_pow) + 1):
-            period = 2**p
-            chinchilla_periods.append(period)
-
-        return warmup, chinchilla_periods
-
-    def configure_lr_scheduler(self, num_params: int) -> Scheduler:
-        warmup, chinchilla_periods = self.configure_chinchilla_periods(num_params)
-        period_lengths = []
-        for pidx, c in enumerate(chinchilla_periods):
-            period = Duration.chinchilla_tokens(c, model_params=num_params).value
-            if pidx == 0:
-                period_lengths.append(period)
-            else:
-                period_lengths.append(
-                    period
-                    - Duration.chinchilla_tokens(
-                        chinchilla_periods[pidx - 1], model_params=num_params
-                    ).value
-                )
-
-        return WSDS(
-            units=SchedulerUnits.tokens,
-            warmup=warmup,
-            decay_fraction=self.decay_fraction,
-            period_lengths=period_lengths,
-        )
-
-    def configure_checkpoint_intervals(self, num_params: int) -> list[tuple[Duration, str]]:
-        # We save two checkpoints for each period. One right before the decay and one at the bottom
-        # of the decay (end of the period).
-        _, chinchilla_periods = self.configure_chinchilla_periods(num_params)
-        checkpoints: list[tuple[Duration, str]] = []
-        for pidx, c in enumerate(chinchilla_periods):
-            period = Duration.chinchilla_tokens(c, model_params=num_params)
-            period_length: int
-            if pidx == 0:
-                period_length = period.value
-            else:
-                period_length = (
-                    period.value
-                    - Duration.chinchilla_tokens(
-                        chinchilla_periods[pidx - 1], model_params=num_params
-                    ).value
-                )
-            pre_decay = dataclasses.replace(
-                period, value=int(period.value - period_length * self.decay_fraction)
-            )
-            checkpoints.append((pre_decay, f"Period {pidx+1}, {c}xC pre-decay"))
-            checkpoints.append((period, f"Period {pidx+1}, {c}xC post-decay"))
-        return checkpoints
-
-    def plot_lr_schedule(self, num_params: int, save_path: PathOrStr | None = None):
-        try:
-            import matplotlib.pyplot as plt  # type: ignore
-            import pandas as pd  # type: ignore
-        except ImportError as exc:
-            raise ImportError(
-                "matplotlib and pandas are required to use the plotting functionality."
-            ) from exc
-
-        optim = self.configure_optimizer(num_params)
-        scheduler = self.configure_lr_scheduler(num_params)
-        warmup, chinchilla_periods = self.configure_chinchilla_periods(num_params)
-        checkpoint_intervals = self.configure_checkpoint_intervals(num_params)
-        t_max = self.configure_duration(num_params).value
-        batch_size = self.configure_batch_size(num_params)
-        tokens_seen = 0
-        tokens = []
-        lrs = []
-        while tokens_seen < t_max:
-            tokens_seen += batch_size
-            lr = float(scheduler.get_lr(optim.lr, tokens_seen, t_max))
-            tokens.append(tokens_seen)
-            lrs.append(lr)
-
-        df = pd.DataFrame({"tokens": tokens, "LR": lrs})
-        df.plot(x="tokens", y="LR", legend=False, figsize=(12, 6))
-        plt.grid(True)
-
-        for c in chinchilla_periods:
-            period = Duration.chinchilla_tokens(c, model_params=num_params).value
-            plt.axvline(x=period, color="red", linestyle="--", alpha=0.5)
-            plt.text(
-                period,
-                0.0,
-                f"{c}xC",
-                color="red",
-                alpha=0.5,
-                horizontalalignment="left",
-                rotation=45,
-            )
-
-        plt.scatter(
-            [d.value for d, _ in checkpoint_intervals],
-            [float(scheduler.get_lr(optim.lr, d.value, t_max)) for d, _ in checkpoint_intervals],
-            color="green",
-            label="Checkpoint",
-        )
-
-        plt.title(
-            f"Learning rate schedule for {format_count(num_params)} model out to {self.chinchilla_multiple}xC"
-        )
-
-        caption = (
-            f"peak LR={optim.lr:.6f}, batch size={format_tokens(batch_size)}\n"
-            f"warmup={format_tokens(warmup)}={warmup // batch_size:,d} steps, "
-            f"duration={format_tokens(t_max)}={t_max // batch_size:,d} steps"
-        )
-        plt.xlabel(f"Tokens\n\n{caption}")
-
-        plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left", borderaxespad=0.0)
-        plt.tight_layout()
-
-        if save_path is not None:
-            plt.savefig(save_path)
-        else:
-            plt.show()
-
-
-@dataclass(kw_only=True)
-class ModelLadder(Config, Generic[M], metaclass=ABCMeta):
+class ModelLadder(Config):
     """
     Represents a complete model ladder of runs.
     """
 
     name: str
     """A name to assign to the ladder."""
+    dir: str
+    """A unique directory where ladder run results and intermediate checkpoints should be saved."""
     sizes: list[str]
     """A list of model size specs to run as part of the ladder."""
-    chinchilla_multiple: float
-    """How long to train each run for, expressed as a multiple of the Chinchilla-optimal duration."""
+    max_devices: int
+    """The number of accelerator devices available to use for each run."""
+    device_type: str
+    """The type of accelerator device available to use for each run (e.g. "NVIDIA H100 80GB HBM3")."""
+    model_configurator: ModelConfigurator
+    """The model configurator to use."""
+    run_configurator: RunConfigurator
+    """The run configurator to use."""
+    data_loader: ComposableDataLoaderConfig
+    """The data loader configuration to use for each run."""
+    instance_sources: list[InstanceSourceConfig]
+    """The instance sources to use for each run."""
     sequence_length: int = 4096
     """The sequence length to train each run on."""
     tokenizer: TokenizerConfig
     """The tokenizer to use."""
-    mix: DataMix
-    """The mix to train on."""
-    mix_base_dir: str = "gs://ai2-llm"
-    """The base directory for the data mix."""
-    root_dir: str
-    """The root directory where ladder run results should be saved."""
     seed: int = 42
     """The initial random seed to use for all runs in the ladder."""
-    intra_document_masking: bool = False
-    """A flag indicating whether to use intra-document masking."""
-    instance_filter: bool = False
-    """A flag indicating whether to use the instance filter with the data loader."""
     backend: str = "cpu:gloo,cuda:nccl"
     """The distributed backend to use for each run."""
 
-    def __post_init__(self):
-        if self.chinchilla_multiple <= 0:
-            raise OLMoConfigurationError("'chinchilla_multiple' must be positive")
-
     @property
     def work_dir(self) -> PathOrStr:
-        return "./cache" if io.is_url(self.root_dir) else str(io.join_path(self.root_dir, "cache"))
+        return "./cache" if io.is_url(self.dir) else str(io.join_path(self.dir, "cache"))
 
-    @abstractmethod
-    def run(self, model_spec: M, overrides: list[str] | None = None):
+    def run(self, size_spec: str):
         """
         Execute a particular model run of the experiment locally and store the results.
         """
-        raise NotImplementedError
+        prepare_training_environment(seed=self.seed, backend=self.backend)
+        set_composable_seed(self.seed)
+
+        # Configure model.
+        model_config = self.model_configurator.configure_model(
+            size_spec=size_spec,
+            sequence_length=self.sequence_length,
+            tokenizer=self.tokenizer,
+            device_type=self.device_type,
+        )
+        num_params = model_config.num_non_embedding_params
+
+        # Configure global batch size, make sure request number of devices matches the number
+        # of devices available.
+        (
+            global_batch_size,
+            device_microbatch_size,
+            requested_devices,
+        ) = self._configure_batch_size_and_num_devices(size_spec, num_params)
+        if requested_devices != dist_utils.get_world_size():
+            raise OLMoConfigurationError(
+                f"Requested {requested_devices} devices for model of size '{size_spec}', "
+                f"but {dist_utils.get_world_size()} are available."
+            )
+
+        # Configure optimizer and scheduler.
+        optim_config = self.run_configurator.configure_optimizer(num_params)
+        scheduler = self.run_configurator.configure_lr_scheduler(num_params)
+
+        # Configure trainer.
+        trainer_config = self._configure_trainer(size_spec, num_params, global_batch_size)
+
+        # Build instance sources and data loader.
+        instance_sources = [
+            source.build(work_dir=self.work_dir) for source in self.instance_sources
+        ]
+        data_loader = self.data_loader.build(
+            *instance_sources,
+            work_dir=self.work_dir,
+            global_batch_size=global_batch_size,
+            tokenizer=self.tokenizer,
+        )
+        if data_loader.sequence_length != self.sequence_length:
+            raise OLMoConfigurationError(
+                f"Data loader sequence of {data_loader.sequence_length} does not match "
+                f"configured sequence length of {self.sequence_length}."
+            )
+
+        # Build train module.
+        train_module = self.model_configurator.build_train_module(
+            size_spec=size_spec,
+            sequence_length=self.sequence_length,
+            device_microbatch_size=device_microbatch_size,
+            model_config=model_config,
+            optim_config=optim_config,
+            scheduler=scheduler,
+            device_type=self.device_type,
+        )
+
+        # Build trainer.
+        trainer = trainer_config.build(train_module, data_loader)
+
+        # Record all configs.
+        config_dict = {
+            "seed": self.seed,
+            "size": size_spec,
+            "model": model_config,
+            "optim": optim_config,
+            "scheduler": scheduler,
+            "data_loader": self.data_loader,
+            "instance_sources": self.instance_sources,
+        }
+        typing.cast(
+            callbacks.ConfigSaverCallback, trainer.callbacks["config_saver"]
+        ).config = config_dict
+
+        # Train.
+        trainer.fit()
+
+        teardown_training_environment()
 
     @abstractmethod
-    def get_metrics_for_run(
-        self, model_spec: M, overrides: list[str] | None = None
-    ) -> dict[str, float] | None:
+    def get_metrics_for_run(self, size_spec: str) -> dict[str, float] | None:
         """
         Retrieve the final metrics for a particular model run of the experiment.
         If the experiment hasn't completed this should return ``None``.
         """
         raise NotImplementedError
 
-    @abstractmethod
-    def configure_model(self, size: str) -> TransformerConfig:
-        """
-        Configure a model spec for a particular size.
-        """
-        raise NotImplementedError
-
-    def configure_global_batch_size(self, num_params: int) -> int:
-        # Calculate global batch size according to https://api.semanticscholar.org/CorpusID:270764838
-        # which assumes a sequence length of 2048.
-        return round(2048 * 160 * (num_params / 108_000_000) ** (2 / 3))
-
-    def configure_dataset(self) -> NumpyFSLDatasetConfig:
-        return NumpyFSLDatasetConfig.from_data_mix(
-            self.mix,
-            mix_base_dir=self.mix_base_dir,
-            tokenizer=self.tokenizer,
-            work_dir=str(self.work_dir),
+    def _configure_batch_size_and_num_devices(
+        self, size_spec: str, num_params: int
+    ) -> tuple[int, int, int]:
+        # Configure global batch size and device micro-batch size.
+        global_batch_size = self.run_configurator.configure_target_batch_size(num_params)
+        device_microbatch_size = self.model_configurator.configure_device_microbatch_size(
+            size_spec=size_spec,
             sequence_length=self.sequence_length,
-            generate_doc_lengths=self.intra_document_masking,
-            instance_filter_config=None
-            if not self.instance_filter
-            else InstanceFilterConfig(
-                repetition_max_period=13, repetition_min_period=1, repetition_max_count=32
-            ),
+            device_type=self.device_type,
         )
+        device_microbatch_size = min(device_microbatch_size, global_batch_size)
 
-    def configure_data_loader(self, global_batch_size: int) -> NumpyDataLoaderConfig:
-        return NumpyDataLoaderConfig(
-            global_batch_size=global_batch_size, seed=self.seed, num_workers=4
+        # Configure minimal device mesh spec, i.e. the minimum number of devices needed and the
+        # corresponding minimum data parallel world size.
+        (
+            min_world_size,
+            min_dp_world_size,
+        ) = self.model_configurator.configure_minimal_device_mesh_spec(
+            size_spec=size_spec,
+            sequence_length=self.sequence_length,
+            device_type=self.device_type,
         )
+        if min_dp_world_size is None:
+            min_dp_world_size = min_world_size
+        if min_world_size % min_dp_world_size != 0:
+            raise OLMoConfigurationError(
+                f"Invalid device mesh spec for model of size '{size_spec}': "
+                f"minimum world size {min_world_size} is not divisible by "
+                f"the minimum data parallel world size {min_dp_world_size}."
+            )
+        if self.max_devices < min_world_size:
+            raise OLMoConfigurationError(
+                f"Not enough devices ({self.max_devices}) to run model of size '{size_spec}' "
+                f"which requires at least {min_world_size} devices."
+            )
 
-    def configure_trainer(self, run_id: str, num_params: int) -> TrainerConfig:
-        run_name = f"{self.name}-{run_id}"
-        save_folder = io.join_path(self.root_dir, io.make_url_safe(self.name), run_id)
+        # And from that we adjust the global batch size to be a multiple of
+        # `device_microbatch_size x min_dp_world_size`.
+        gbz_factor = device_microbatch_size * min_dp_world_size
+        global_batch_size = round(global_batch_size / gbz_factor) * gbz_factor
 
-        # Calculate training duration based on Chinchilla scaling laws.
-        duration = Duration.chinchilla_tokens(
-            self.chinchilla_multiple,
-            model_params=num_params,
-        )
+        # Then we can determine the actual number of devices to allocate to the run. In particular
+        # we can expand `min_world_size` up to the number of devices available (`self.max_devices`)
+        # by a factor that's just the number of gradient accumulation steps needed with the minimum
+        # requested number of devices.
+        max_num_grad_accum_steps = global_batch_size // gbz_factor
+        expansion_factor = min(self.max_devices // min_world_size, max_num_grad_accum_steps)
+        num_devices = min_world_size * expansion_factor
+        return global_batch_size, device_microbatch_size, num_devices
+
+    def _configure_trainer(
+        self, size_spec: str, num_params: int, global_batch_size: int
+    ) -> TrainerConfig:
+        run_name = f"{self.name}-{size_spec}"
+        save_folder = io.join_path(self.dir, size_spec)
+        duration = self.run_configurator.configure_duration(num_params)
+
+        # Determine checkpoint intervals, convert from durations to steps.
+        checkpoint_intervals = [
+            d for d, _ in self.run_configurator.configure_checkpoint_intervals(num_params)
+        ]
+        checkpoint_interval_steps: list[int] = []
+        for d in checkpoint_intervals:
+            if d.unit == DurationUnit.steps:
+                checkpoint_interval_steps.append(d.value)
+            elif d.unit == DurationUnit.tokens:
+                steps = d.value // global_batch_size
+                checkpoint_interval_steps.append(steps)
+            else:
+                raise OLMoConfigurationError(
+                    f"Unsupported checkpoint interval duration unit: {d.unit}."
+                )
 
         return TrainerConfig(
             save_folder=str(save_folder),
@@ -405,8 +356,11 @@ class ModelLadder(Config, Generic[M], metaclass=ABCMeta):
                 "config_saver": callbacks.ConfigSaverCallback(),
                 "garbage_collector": callbacks.GarbageCollectorCallback(),
                 "checkpointer": callbacks.CheckpointerCallback(
-                    save_interval=1_000,
+                    ephemeral_save_interval=1000,
+                    ephemeral_cooldown=250,
+                    save_interval=None,
                     save_async=True,
+                    fixed_steps=checkpoint_interval_steps,
                 ),
                 "profiler": callbacks.ProfilerCallback(enabled=False),
                 "gap_monitor": callbacks.GAPMonitorCallback(enabled=False),
@@ -420,16 +374,18 @@ class ModelLadder(Config, Generic[M], metaclass=ABCMeta):
                 ),
                 "downstream_evaluator": callbacks.DownstreamEvaluatorCallbackConfig(
                     tokenizer=self.tokenizer,
-                    tasks=self.get_in_loop_eval_tasks(),
-                    eval_interval=1_000,
+                    tasks=self._get_in_loop_eval_tasks(),
+                    eval_interval=None,
+                    fixed_steps=checkpoint_interval_steps,
                 ),
                 "metric_saver": callbacks.MetricSaverCallback(
-                    metrics_to_capture=["train/*", "optim/*", "eval/*"]
+                    metrics_to_capture=["train/*", "optim/*", "eval/*"],
+                    fixed_steps=checkpoint_interval_steps,
                 ),
             },
         )
 
-    def get_in_loop_eval_tasks(self) -> list[str]:
+    def _get_in_loop_eval_tasks(self) -> list[str]:
         # For training runs where we don't expect the model to acquire MC (e.g., 1B-5xC, short 7B training runs).
         tasks_small_compute = [
             # OLMES Core 9(-ish) RC

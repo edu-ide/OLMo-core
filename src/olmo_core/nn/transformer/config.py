@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Dict, List, Optional
 
-from olmo_core.config import Config, DType, StrEnum
+from olmo_core.config import DType, StrEnum
 from olmo_core.doc_utils import beta_feature
 from olmo_core.exceptions import OLMoConfigurationError
 from olmo_core.utils import ensure_multiple_of
@@ -16,6 +16,7 @@ from ..attention import (
     SlidingWindowAttentionConfig,
 )
 from ..buffer_cache import BufferCache
+from ..config import ModelConfig, ModuleConfig
 from ..feed_forward import FeedForwardConfig, FeedForwardType
 from ..layer_norm import LayerNormConfig, LayerNormType
 from ..lm_head import LMHeadConfig, LMHeadType
@@ -142,7 +143,7 @@ class TransformerBlockType(StrEnum):
 
 
 @dataclass
-class TransformerBlockConfig(Config):
+class TransformerBlockConfig(ModuleConfig):
     """
     A configuration class for easily building transformer blocks.
     """
@@ -278,7 +279,7 @@ class TransformerBlockConfig(Config):
 
 
 @dataclass
-class TransformerConfig(Config):
+class TransformerConfig(ModelConfig):
     """
     A config for easily building transformer models.
 

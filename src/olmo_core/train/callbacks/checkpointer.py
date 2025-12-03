@@ -60,7 +60,7 @@ class CheckpointerCallback(Callback):
 
     priority: ClassVar[int] = 1
 
-    save_interval: int = 250
+    save_interval: Optional[int] = 250
     """
     The interval, in steps, with which to save permanent checkoints.
     """
@@ -94,7 +94,7 @@ class CheckpointerCallback(Callback):
     The number of steps to wait after saving a checkpoint before another ephemeral one.
     """
 
-    fixed_checkpoints: Optional[List[int]] = None
+    fixed_steps: Optional[List[int]] = None
     """
     A list of fixed steps at which to save additional permanent checkpoints.
     """
@@ -113,12 +113,15 @@ class CheckpointerCallback(Callback):
     _checkpoints_to_remove: List[str] = field(default_factory=list)
 
     def __post_init__(self):
-        if self.save_interval < 1:
+        if self.save_interval is not None and self.save_interval < 1:
             raise OLMoConfigurationError("'save_interval' must be at least 1")
         if self.ephemeral_save_interval is not None:
             if self.ephemeral_save_interval < 1:
                 raise OLMoConfigurationError("'ephemeral_save_interval' must be at least 1")
-            if self.ephemeral_save_interval >= self.save_interval:
+            if (
+                self.save_interval is not None
+                and self.ephemeral_save_interval >= self.save_interval
+            ):
                 raise OLMoConfigurationError(
                     "'ephemeral_save_interval' must be less than 'save_interval'"
                 )
@@ -228,7 +231,11 @@ class CheckpointerCallback(Callback):
                         if (
                             step_num == 0
                             or step_num > self.step
-                            or step_num % self.save_interval == 0
+                            or (self.fixed_steps is not None and step_num in self.fixed_steps)
+                            or (
+                                self.save_interval is not None
+                                and step_num % self.save_interval == 0
+                            )
                         ):
                             continue
                         elif (
@@ -262,10 +269,10 @@ class CheckpointerCallback(Callback):
         if not self.checkpoint_pending:
             self._remove_old_checkpoints()
 
-        if self.fixed_checkpoints is not None and self.step in self.fixed_checkpoints:
+        if self.fixed_steps is not None and self.step in self.fixed_steps:
             # Save permanent checkpoint.
             self._checkpoints.append(self._save_checkpoint())
-        elif self.step % self.save_interval == 0:
+        elif self.save_interval is not None and self.step % self.save_interval == 0:
             # Save permanent checkpoint.
             self._checkpoints.append(self._save_checkpoint())
         elif (
