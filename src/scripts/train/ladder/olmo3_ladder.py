@@ -210,7 +210,7 @@ def launch_benchmark(args: argparse.Namespace):
     prepare_cli_environment()
     ladder = configure_ladder(args)
     launcher = configure_launcher(args, ladder, "benchmark")
-    log.info(launcher)
+    launcher.launch(follow=True, slack_notifications=False)
 
 
 if __name__ == "__main__":
