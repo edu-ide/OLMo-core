@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Dict, List, Optional
 
@@ -704,6 +704,39 @@ class TransformerConfig(Config):
             **kwargs,
         )
         return config
+
+    @classmethod
+    def olmo3_7B_hybrid_gated(
+        cls,
+        vocab_size: int,
+        *,
+        hybrid_period: int = 4,
+        gate_backend: Optional[AttentionBackendName] = AttentionBackendName.flash_2,
+        **kwargs,
+    ) -> "TransformerConfig":
+        """
+        A 7B config with hybrid attention:
+        - every ``hybrid_period``-th layer uses standard softmax attention
+        - other layers use gated-output attention (head-wise sigmoid on SDPA output)
+
+        This mirrors Qwen3-Next 스타일의 하이브리드 어텐션(소량의 소프트맥스 레이어 유지).
+        """
+        base = cls.olmo3_7B(vocab_size=vocab_size, attn_backend=gate_backend, **kwargs)
+        block_overrides: Dict[int, TransformerBlockConfig] = {}
+
+        for i in range(base.n_layers):
+            # copy base block
+            blk = replace(base.block)
+            attn = replace(blk.attention)
+
+            # layers divisible by period use standard attention, others use gated_output
+            if (i % hybrid_period) != (hybrid_period - 1):
+                attn.name = AttentionType.gated_output
+            blk.attention = attn
+            block_overrides[i] = blk
+
+        base.block_overrides = block_overrides
+        return base
 
     @classmethod
     def smallmoe(cls, vocab_size: int, **kwargs) -> "TransformerConfig":
