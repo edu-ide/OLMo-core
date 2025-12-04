@@ -111,8 +111,10 @@ class TransformerModelConfigurator(ModelConfigurator[TransformerConfig]):
 
         num_params = size_spec.num_params
         mbz: int
-        if num_params <= 370e6:
+        if num_params <= 190e6:
             mbz = 16 * 4096
+        elif num_params <= 370e6:
+            mbz = 12 * 4096
         elif num_params <= 760e6:
             mbz = 10 * 4096
         elif num_params <= 1e9:
