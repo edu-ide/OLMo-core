@@ -739,6 +739,54 @@ class TransformerConfig(Config):
         return base
 
     @classmethod
+    def olmo3_7B_hybrid_moe(
+        cls,
+        vocab_size: int,
+        *,
+        hybrid_period: int = 2,
+        num_experts: int = 64,
+        top_k: int = 8,
+        capacity_factor: float = 1.25,
+        shared_expert: bool = True,
+        lb_loss_weight: float = 0.01,
+        z_loss_weight: float = 0.001,
+        attn_backend: Optional[AttentionBackendName] = AttentionBackendName.flash_2,
+        **kwargs,
+    ) -> "TransformerConfig":
+        """
+        A 7B hybrid MoE preset:
+        - every ``hybrid_period``-th layer uses MoE FFN
+        - other layers use dense FFN
+        - MoE uses top-k routing with optional shared expert and load-balance losses.
+        """
+        base = cls.olmo3_7B(vocab_size=vocab_size, attn_backend=attn_backend, **kwargs)
+        block_overrides: Dict[int, TransformerBlockConfig] = {}
+
+        moe_ffn = MoEConfig(
+            name=MoEType.default,
+            num_experts=num_experts,
+            hidden_size=int(0.5 * base.d_model),
+            capacity_factor=capacity_factor,
+            router=MoERouterConfig(top_k=top_k),
+            shared_mlp=FeedForwardConfig(hidden_size=base.d_model * 2) if shared_expert else None,
+            lb_loss_weight=lb_loss_weight,
+            z_loss_weight=z_loss_weight,
+        )
+
+        for i in range(base.n_layers):
+            blk = replace(base.block)
+            if i % hybrid_period == 0:
+                # MoE block: keep attention, swap FFN to MoE
+                blk.feed_forward = None
+                blk.feed_forward_moe = moe_ffn
+                blk.name = TransformerBlockType.moe_reordered_norm
+            block_overrides[i] = blk
+
+        base.block_overrides = block_overrides
+        base.name = TransformerType.moe
+        return base
+
+    @classmethod
     def smallmoe(cls, vocab_size: int, **kwargs) -> "TransformerConfig":
         d_model = kwargs.pop("d_model", 768)
         return cls.llama_like(
