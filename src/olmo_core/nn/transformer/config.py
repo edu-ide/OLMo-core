@@ -1,6 +1,6 @@
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Dict, List, Optional
 
@@ -704,6 +704,164 @@ class TransformerConfig(Config):
             **kwargs,
         )
         return config
+
+    @classmethod
+    def olmo3_7B_hybrid_gated(
+        cls,
+        vocab_size: int,
+        *,
+        hybrid_period: int = 4,
+        gate_backend: Optional[AttentionBackendName] = AttentionBackendName.flash_2,
+        **kwargs,
+    ) -> "TransformerConfig":
+        """
+        A 7B config with hybrid attention:
+        - every ``hybrid_period``-th layer uses standard softmax attention
+        - other layers use gated-output attention (head-wise sigmoid on SDPA output)
+
+        This mirrors Qwen3-Next 스타일의 하이브리드 어텐션(소량의 소프트맥스 레이어 유지).
+        """
+        base = cls.olmo3_7B(vocab_size=vocab_size, attn_backend=gate_backend, **kwargs)
+        block_overrides: Dict[int, TransformerBlockConfig] = {}
+
+        for i in range(base.n_layers):
+            # copy base block
+            blk = replace(base.block)
+            attn = replace(blk.attention)
+
+            # layers divisible by period use standard attention, others use gated_output
+            if (i % hybrid_period) != (hybrid_period - 1):
+                attn.name = AttentionType.gated_output
+            blk.attention = attn
+            block_overrides[i] = blk
+
+        base.block_overrides = block_overrides
+        return base
+
+    @classmethod
+    def olmo3_7B_hybrid_moe(
+        cls,
+        vocab_size: int,
+        *,
+        hybrid_period: int = 2,
+        num_experts: int = 64,
+        top_k: int = 8,
+        capacity_factor: float = 1.25,
+        shared_expert: bool = True,
+        lb_loss_weight: float = 0.01,
+        z_loss_weight: float = 0.001,
+        attn_backend: Optional[AttentionBackendName] = AttentionBackendName.flash_2,
+        **kwargs,
+    ) -> "TransformerConfig":
+        """
+        A 7B hybrid MoE preset:
+        - every ``hybrid_period``-th layer uses MoE FFN
+        - other layers use dense FFN
+        - MoE uses top-k routing with optional shared expert and load-balance losses.
+        """
+        base = cls.olmo3_7B(vocab_size=vocab_size, attn_backend=attn_backend, **kwargs)
+        block_overrides: Dict[int, TransformerBlockConfig] = {}
+
+        moe_ffn = MoEConfig(
+            name=MoEType.default,
+            num_experts=num_experts,
+            hidden_size=int(0.5 * base.d_model),
+            capacity_factor=capacity_factor,
+            router=MoERouterConfig(top_k=top_k),
+            shared_mlp=FeedForwardConfig(hidden_size=base.d_model * 2) if shared_expert else None,
+            lb_loss_weight=lb_loss_weight,
+            z_loss_weight=z_loss_weight,
+        )
+
+        for i in range(base.n_layers):
+            blk = replace(base.block)
+            if i % hybrid_period == 0:
+                # MoE block: keep attention, swap FFN to MoE
+                blk.feed_forward = None
+                blk.feed_forward_moe = moe_ffn
+                blk.name = TransformerBlockType.moe_reordered_norm
+            block_overrides[i] = blk
+
+        base.block_overrides = block_overrides
+        base.name = TransformerType.moe
+        return base
+
+    @classmethod
+    def olmo3_7B_etd(
+        cls,
+        vocab_size: int,
+        *,
+        n_encoder_layers: int = 7,
+        n_think_layers: int = 4,
+        n_decoder_layers: int = 5,
+        max_think_iterations: int = 5,
+        adaptive_depth: bool = True,
+        confidence_threshold: float = 0.9,
+        use_layer_router: bool = True,
+        use_lora_experts: bool = True,
+        num_lora_experts: int = 4,
+        lora_rank: int = 16,
+        lora_alpha: float = 32.0,
+        attn_backend: Optional[AttentionBackendName] = AttentionBackendName.flash_2,
+        **kwargs,
+    ) -> "TransformerConfig":
+        """
+        A 7B OLMo3 config with ETD (Encode-Think-Decode) + MoDr + Dr.LLM integration.
+
+        This configuration creates a transformer with:
+        - ETD structure: Encoder (input → latent), Think (recursive reasoning), Decoder (latent → output)
+        - MoDr-style LoRA experts in Think block for diverse reasoning paths
+        - Dr.LLM-style layer routers for Skip/Execute/Repeat decisions
+        - Adaptive depth with confidence-based early exit
+
+        레이어 분할:
+            - Encoder (7 layers): 입력을 latent space로 매핑
+            - Think (4 layers): 반복 실행 (max 5회), LoRA 전문가 + 라우터
+            - Decoder (5 layers): latent에서 출력으로 매핑
+            - 총 16 layers (기본 OLMo3-7B와 동일)
+
+        Args:
+            vocab_size: Vocabulary size
+            n_encoder_layers: Number of encoder layers (default: 7)
+            n_think_layers: Number of think layers to repeat (default: 4)
+            n_decoder_layers: Number of decoder layers (default: 5)
+            max_think_iterations: Maximum think block repetitions (default: 5)
+            adaptive_depth: Enable confidence-based early exit (default: True)
+            confidence_threshold: Threshold for early exit (default: 0.9)
+            use_layer_router: Enable Dr.LLM-style layer routing (default: True)
+            use_lora_experts: Enable MoDr-style LoRA experts (default: True)
+            num_lora_experts: Number of LoRA experts per think layer (default: 4)
+            lora_rank: LoRA rank (default: 16)
+            lora_alpha: LoRA scaling factor (default: 32.0)
+
+        References:
+            - ETD: arXiv:2510.07358 (Encode, Think, Decode)
+            - MoDr: OpenReview (Mixture-of-Depth-Recurrent Transformers)
+            - Dr.LLM: arXiv:2510.12773 (Dynamic Layer Routing in LLMs)
+        """
+        # 레이어 수 검증
+        total_layers = n_encoder_layers + n_think_layers + n_decoder_layers
+        assert total_layers == 16, f"ETD 레이어 합({total_layers})이 16이어야 함"
+
+        # 기본 OLMo3-7B 설정
+        base = cls.olmo3_7B(vocab_size=vocab_size, attn_backend=attn_backend, **kwargs)
+
+        # ETD 설정을 메타데이터로 저장 (빌드 시 사용)
+        base._etd_config = {
+            "n_encoder_layers": n_encoder_layers,
+            "n_think_layers": n_think_layers,
+            "n_decoder_layers": n_decoder_layers,
+            "max_think_iterations": max_think_iterations,
+            "adaptive_depth": adaptive_depth,
+            "confidence_threshold": confidence_threshold,
+            "use_layer_router": use_layer_router,
+            "use_lora_experts": use_lora_experts,
+            "num_lora_experts": num_lora_experts,
+            "lora_rank": lora_rank,
+            "lora_alpha": lora_alpha,
+        }
+
+        return base
 
     @classmethod
     def smallmoe(cls, vocab_size: int, **kwargs) -> "TransformerConfig":

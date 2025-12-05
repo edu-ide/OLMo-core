@@ -79,6 +79,11 @@ class MoERouterGatingFunction(StrEnum):
 class MoERouterConfig(Config):
     """
     A configuration class for easily building any of the different MoE router modules.
+
+    DeepSeek-V3 reference (inference/model.py):
+    - route_scale: Scaling factor applied to routing weights after top-k selection
+    - score_func: Either 'softmax' or 'sigmoid' for routing score computation
+    - bias: Auxiliary-loss-free load balancing via learnable bias
     """
 
     name: MoERouterType = MoERouterType.default
@@ -92,6 +97,22 @@ class MoERouterConfig(Config):
     bias_gamma: Optional[float] = None
     gating_function: MoERouterGatingFunction = MoERouterGatingFunction.softmax
     dtype: Optional[DType] = None
+    route_scale: float = 1.0
+    """
+    DeepSeek-V3 style route scaling. Applied to expert weights after selection.
+    Default 1.0 (no scaling). Typical values: 2.5 for 671B, 16.0 for 236B.
+    Reference: DeepSeek-V3/inference/model.py line 597 - weights *= self.route_scale
+    """
+    n_expert_groups: int = 1
+    """
+    Number of expert groups for hierarchical routing (DeepSeek-V3 n_groups).
+    When > 1, routes to top-k groups first, then selects experts within groups.
+    """
+    n_limited_groups: Optional[int] = None
+    """
+    Number of groups to limit routing to (DeepSeek-V3 topk_groups).
+    Only used when n_expert_groups > 1. Defaults to 1 if not set.
+    """
 
     def num_params(self, d_model: int, num_experts: int) -> int:
         """
@@ -165,6 +186,10 @@ class MoERouter(nn.Module):
     :param bias_gamma: If set to a positive float, experts scores for top-k routing will be adjusted
         by a bias following the "auxiliary-loss-free load balancing" strategy from DeepSeek-v3.
         A reasonable value is on the order of 0.0001.
+    :param route_scale: DeepSeek-V3 style scaling factor applied to expert weights after selection.
+        Default 1.0 (no scaling). Reference: DeepSeek-V3/inference/model.py line 597.
+    :param n_expert_groups: Number of expert groups for hierarchical routing (DeepSeek-V3).
+    :param n_limited_groups: Number of groups to limit routing to when using expert groups.
     """
 
     def __init__(
@@ -182,6 +207,9 @@ class MoERouter(nn.Module):
         lb_loss_granularity: MoELoadBalancingLossGranularity = MoELoadBalancingLossGranularity.local_batch,
         z_loss_weight: Optional[float] = None,
         init_device: str = "cpu",
+        route_scale: float = 1.0,
+        n_expert_groups: int = 1,
+        n_limited_groups: Optional[int] = None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -198,6 +226,10 @@ class MoERouter(nn.Module):
         self.group: Optional[dist.ProcessGroup] = None
         self.cp_mesh: Optional[dist.DeviceMesh] = None
         self.tp_mesh: Optional[dist.DeviceMesh] = None
+        # DeepSeek-V3 style parameters
+        self.route_scale = route_scale
+        self.n_expert_groups = n_expert_groups
+        self.n_limited_groups = n_limited_groups if n_limited_groups is not None else 1
 
         if self.bias_gamma is not None:
             assert self.bias_gamma > 0
@@ -336,24 +368,67 @@ class MoERouter(nn.Module):
             return x * (low + noise * (high - low))
 
     def get_top_k(self, scores: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get top-k expert weights and indices.
+
+        Supports DeepSeek-V3 style hierarchical routing when n_expert_groups > 1:
+        1. Score each expert group
+        2. Select top-k groups
+        3. Mask out experts in non-selected groups
+        4. Select top-k experts from remaining
+
+        Reference: DeepSeek-V3/inference/model.py lines 584-598
+        """
         expert_weights: torch.Tensor
         expert_indices: torch.Tensor
-        if self.bias_gamma is None:
-            if self.top_k == 1:
-                expert_weights, expert_indices = scores.max(dim=-1, keepdim=True)
-            else:
-                expert_weights, expert_indices = torch.topk(scores, self.top_k, dim=-1)
-        else:
+
+        # Original scores for final weight gathering
+        original_scores = scores
+
+        # Add bias if using auxiliary-loss-free load balancing
+        if self.bias_gamma is not None:
             assert self.score_bias is not None
-            with torch.no_grad():
-                _, expert_indices = torch.topk(
-                    scores + self.score_bias.unsqueeze(0), self.top_k, dim=-1  # type: ignore
-                )
-            expert_weights = scores.gather(-1, expert_indices)
+            scores = scores + self.score_bias.unsqueeze(0)  # type: ignore
+
+        # DeepSeek-V3 style expert group routing
+        # Reference: DeepSeek-V3/inference/model.py lines 584-592
+        if self.n_expert_groups > 1:
+            # Reshape to [batch_size, seq_len, n_groups, experts_per_group]
+            experts_per_group = self.num_experts // self.n_expert_groups
+            scores_grouped = scores.view(*scores.shape[:-1], self.n_expert_groups, experts_per_group)
+
+            # Get group scores (max within each group)
+            group_scores = scores_grouped.amax(dim=-1)  # [batch_size, seq_len, n_groups]
+
+            # Select top-k groups
+            _, group_indices = torch.topk(group_scores, self.n_limited_groups, dim=-1)
+
+            # Create mask for non-selected groups
+            group_mask = torch.ones_like(group_scores, dtype=torch.bool)
+            group_mask.scatter_(-1, group_indices, False)
+
+            # Apply mask to expert scores (set non-selected groups to -inf)
+            group_mask = group_mask.unsqueeze(-1).expand_as(scores_grouped)
+            scores_grouped = scores_grouped.masked_fill(group_mask, float("-inf"))
+            scores = scores_grouped.flatten(-2)  # Back to [batch_size, seq_len, num_experts]
+
+        # Select top-k experts
+        if self.top_k == 1:
+            _, expert_indices = scores.max(dim=-1, keepdim=True)
+        else:
+            _, expert_indices = torch.topk(scores, self.top_k, dim=-1)
+
+        # Gather weights from original scores (without bias)
+        expert_weights = original_scores.gather(-1, expert_indices)
+
+        # For sigmoid scoring, normalize weights to sum to 1
+        # Reference: DeepSeek-V3/inference/model.py lines 595-596
+        if self.gating_function == MoERouterGatingFunction.sigmoid:
+            expert_weights = expert_weights / (expert_weights.sum(dim=-1, keepdim=True) + 1e-7)
 
         if self.uniform_expert_assignment:
             expert_indices = _uniform_expert_assignment(expert_indices, self.num_experts)
-            expert_weights = scores.gather(-1, expert_indices)
+            expert_weights = original_scores.gather(-1, expert_indices)
 
         return expert_weights, expert_indices
 
@@ -452,6 +527,11 @@ class MoERouter(nn.Module):
                     keepdim=True,
                 )
             )
+
+        # DeepSeek-V3 style route scaling
+        # Reference: DeepSeek-V3/inference/model.py line 597 - weights *= self.route_scale
+        if self.route_scale != 1.0:
+            expert_weights = expert_weights * self.route_scale
 
         with torch.no_grad():
             # Histogram the expert ids to identify the number of items/tokens routed to each expert.

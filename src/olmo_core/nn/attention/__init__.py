@@ -55,6 +55,8 @@ __all__ = [
     "AttentionConfig",
     "AttentionBase",
     "Attention",
+    "GatedOutputAttention",
+    "GatedDeltaNetAttention",
     "FusedAttention",
     "NormalizedAttention",
     "RingAttentionLoadBalancerType",
@@ -141,6 +143,16 @@ class AttentionType(StrEnum):
     """
     ➡️ :class:`NormalizedAttention`
     """
+    gated_output = "gated_output"
+    """
+    ➡️ :class:`GatedOutputAttention`
+    Applies a head-wise sigmoid gate on the SDPA output (cf. arXiv:2505.06708).
+    """
+    gated_deltanet = "gated_deltanet"
+    """
+    ➡️ :class:`GatedDeltaNetAttention`
+    Linear attention with gated decay + delta-style update (cf. arXiv:2412.06464).
+    """
 
 
 @dataclass
@@ -167,6 +179,7 @@ class AttentionConfig(Config):
     dtype: DType = DType.float32
     sliding_window: Optional[SlidingWindowAttentionConfig] = None
     use_head_qk_norm: Optional[bool] = None
+    gate_bias: Optional[bool] = None
 
     def num_params(self, d_model: int) -> int:
         """
@@ -203,6 +216,13 @@ class AttentionConfig(Config):
         params += d_model * d_model
         if bias:
             params += d_model
+
+        # Optional gating projection (for gated_output attention).
+        if self.name in (AttentionType.gated_output, AttentionType.gated_deltanet):
+            gate_bias = self.gate_bias if self.gate_bias is not None else bias
+            params += d_model * n_heads
+            if gate_bias:
+                params += n_heads
 
         # Block QK scaling factors.
         if self.name == AttentionType.normalized:
@@ -261,6 +281,12 @@ class AttentionConfig(Config):
                         "'window_size' is not supported with normalized attention"
                     )
                 return NormalizedAttention(**kwargs)
+            elif self.name == "gated_output":
+                # Gated SDPA (head-wise sigmoid after attention)
+                return GatedOutputAttention(**kwargs)
+            elif self.name == "gated_deltanet":
+                # Gated DeltaNet linear attention (not flash-optimized; training use only)
+                return GatedDeltaNetAttention(**kwargs)
             else:
                 raise NotImplementedError(self.name)
         except TypeError as e:
@@ -647,6 +673,335 @@ class Attention(AttentionBase):
             head_dim=self.head_dim,
             device=self.w_k.weight.device,
         )
+
+
+class GatedOutputAttention(Attention):
+    """
+    Multi-head attention with a head-wise sigmoid gate applied to the SDPA output.
+
+    Gate is derived from a learned linear projection of the input (query-side signal),
+    following the findings in "Gated Attention for LLMs" (arXiv:2505.06708).
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        n_heads: int,
+        n_kv_heads: Optional[int] = None,
+        bias: bool = True,
+        rope: Optional[RoPEConfig] = None,
+        clip_qkv: Optional[float] = None,
+        qk_norm: Optional[LayerNormConfig] = None,
+        dropout: float = 0.0,
+        softmax_scale: Optional[float] = None,
+        use_flash: Optional[bool] = None,
+        backend: Optional[AttentionBackendName] = None,
+        window_size: Optional[int] = None,
+        dtype: torch.dtype = torch.float32,
+        init_device: str = "cpu",
+        cache: Optional[BufferCache] = None,
+        gate_bias: Optional[bool] = None,
+    ):
+        super().__init__(
+            d_model=d_model,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            bias=bias,
+            rope=rope,
+            clip_qkv=clip_qkv,
+            qk_norm=qk_norm,
+            dropout=dropout,
+            softmax_scale=softmax_scale,
+            use_flash=use_flash,
+            backend=backend,
+            window_size=window_size,
+            dtype=dtype,
+            init_device=init_device,
+            cache=cache,
+        )
+        g_bias = bias if gate_bias is None else gate_bias
+        self.w_gate = nn.Linear(
+            d_model, self.n_heads, bias=g_bias, dtype=dtype, device=init_device
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_doc_lens: Optional[torch.Tensor] = None,
+        cu_doc_lens_q: Optional[torch.Tensor] = None,
+        cu_doc_lens_k: Optional[torch.Tensor] = None,
+        max_doc_len: Optional[int] = None,
+        max_doc_len_q: Optional[int] = None,
+        max_doc_len_k: Optional[int] = None,
+        local_k_slice: Optional[slice] = None,
+        pos_sin: Optional[torch.Tensor] = None,
+        pos_cos: Optional[torch.Tensor] = None,
+        freqs_cis: Optional[torch.Tensor] = None,
+        cache_leftpad: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        B, T, _ = x.shape
+
+        # projections
+        q, k, v = self.w_q(x), self.w_k(x), self.w_v(x)
+
+        if self.clip_qkv is not None:
+            q.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
+            k.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
+            v.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
+
+        if not self.use_head_qk_norm:
+            if self.q_norm is not None:
+                q = self.q_norm(q)
+            if self.k_norm is not None:
+                k = self.k_norm(k)
+
+        q = q.view(B, T, -1, self.head_dim)
+        k = k.view(B, T, -1, self.head_dim)
+        v = v.view(B, T, -1, self.head_dim)
+
+        if self.use_head_qk_norm:
+            if self.q_norm is not None:
+                q = self.q_norm(q)
+            if self.k_norm is not None:
+                k = self.k_norm(k)
+
+        if self.rope is not None:
+            if self.cp_enabled and pos_sin is None and pos_cos is None and freqs_cis is None:
+                raise RuntimeError(
+                    "RoPE buffers must be passed through to attention after being properly "
+                    "sharded by the context parallel load balancer"
+                )
+            start_pos = self.kv_cache_manager.current_position() if self.kv_cache_manager else None
+            q, k = self.rope(
+                q,
+                k,
+                head_first=False,
+                start_pos=start_pos,
+                pos_sin=pos_sin,
+                pos_cos=pos_cos,
+                freqs_cis=freqs_cis,
+            )
+
+        att = self.sdpa(
+            q,
+            k,
+            v,
+            cu_doc_lens=cu_doc_lens,
+            cu_doc_lens_q=cu_doc_lens_q,
+            cu_doc_lens_k=cu_doc_lens_k,
+            max_doc_len=max_doc_len,
+            max_doc_len_q=max_doc_len_q,
+            max_doc_len_k=max_doc_len_k,
+            local_k_slice=local_k_slice,
+            cache_leftpad=cache_leftpad,
+        )
+
+        # Gate per head on SDPA output (shape: B, T, n_heads, head_dim).
+        gate_logits = self.w_gate(x).view(B, T, -1, 1)
+        gate = torch.sigmoid(gate_logits)
+        att = att * gate
+
+        att = att.view(B, T, -1)
+        return self.w_out(att)
+
+    def apply_tp(
+        self,
+        tp_mesh: DeviceMesh,
+        input_layout: Optional[Placement] = None,
+        output_layout: Optional[Placement] = None,
+        use_local_output: bool = True,
+        float8_enabled: bool = False,
+    ):
+        # Reuse base sharding and add gating projection.
+        rowwise_parallel, colwise_parallel, prepare_module_input = get_tp_wrappers(
+            float8_enabled=float8_enabled
+        )
+
+        parallelize_module(
+            self,
+            device_mesh=tp_mesh,
+            parallelize_plan=prepare_module_input(
+                input_layouts=None if input_layout is None else (input_layout,),
+                desired_input_layouts=(Replicate(),),
+            ),
+        )
+
+        plan = {
+            "w_q": colwise_parallel(
+                output_layouts=None if self.q_norm is None else Shard(1),
+                use_local_output=self.q_norm is None,
+            ),
+            "w_k": colwise_parallel(
+                output_layouts=None if self.k_norm is None else Shard(1),
+                use_local_output=self.k_norm is None,
+            ),
+            "w_v": colwise_parallel(),
+            "w_gate": colwise_parallel(),
+            "w_out": rowwise_parallel(
+                output_layouts=output_layout, use_local_output=use_local_output
+            ),
+        }
+        if self.q_norm is not None:
+            plan["q_norm"] = SequenceParallel(use_local_output=True, output_layouts=Shard(2))
+        if self.k_norm is not None:
+            plan["k_norm"] = SequenceParallel(use_local_output=True, output_layouts=Shard(2))
+
+        parallelize_module(
+            module=self,
+            device_mesh=tp_mesh,
+            parallelize_plan=plan,
+        )
+
+
+class GatedDeltaNetAttention(AttentionBase):
+    """
+    Linear attention with gated decay + delta-style update (simplified, training-oriented).
+
+    Implements a recurrent state update per token:
+        S_t = sigmoid(g_t) * S_{t-1} + v_t k_t^T
+        o_t = S_t q_t
+    where g_t is a head-wise gate derived from the input.
+
+    Note: This is a reference implementation (not flash-optimized, no TP/CP yet) intended for
+    experimentation with Gated DeltaNet-style layers on moderate sequence lengths.
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        n_heads: int,
+        n_kv_heads: Optional[int] = None,
+        bias: bool = True,
+        rope: Optional[RoPEConfig] = None,
+        clip_qkv: Optional[float] = None,
+        qk_norm: Optional[LayerNormConfig] = None,
+        dtype: torch.dtype = torch.float32,
+        init_device: str = "cpu",
+        cache: Optional[BufferCache] = None,
+        gate_bias: Optional[bool] = None,
+        window_size: Optional[int] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        del cache, kwargs  # cache not used here
+        if window_size:
+            log.warning("GatedDeltaNetAttention ignores window_size; it uses full sequence.")
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads if n_kv_heads is not None else n_heads
+        if self.n_kv_heads not in (1, self.n_heads):
+            raise OLMoConfigurationError(
+                "GatedDeltaNetAttention supports n_kv_heads = 1 or n_heads (MQA/GQA not supported)."
+            )
+        self.head_dim = d_model // n_heads
+        self.w_q = nn.Linear(d_model, d_model, bias=bias, dtype=dtype, device=init_device)
+        self.w_k = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=bias, dtype=dtype, device=init_device)
+        self.w_v = nn.Linear(d_model, self.n_kv_heads * self.head_dim, bias=bias, dtype=dtype, device=init_device)
+        self.w_out = nn.Linear(d_model, d_model, bias=bias, dtype=dtype, device=init_device)
+        g_bias = bias if gate_bias is None else gate_bias
+        self.w_gate = nn.Linear(d_model, self.n_heads, bias=g_bias, dtype=dtype, device=init_device)
+        self.clip_qkv = clip_qkv
+        self.q_norm = qk_norm.build(self.head_dim) if qk_norm is not None else None
+        self.k_norm = qk_norm.build(self.head_dim) if qk_norm is not None else None
+        self.rope = rope.build(self.head_dim, cache=None) if rope is not None else None
+
+    @property
+    def cp_enabled(self) -> bool:
+        return False
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cu_doc_lens: Optional[torch.Tensor] = None,
+        cu_doc_lens_q: Optional[torch.Tensor] = None,
+        cu_doc_lens_k: Optional[torch.Tensor] = None,
+        max_doc_len: Optional[int] = None,
+        max_doc_len_q: Optional[int] = None,
+        max_doc_len_k: Optional[int] = None,
+        local_k_slice: Optional[slice] = None,
+        pos_sin: Optional[torch.Tensor] = None,
+        pos_cos: Optional[torch.Tensor] = None,
+        freqs_cis: Optional[torch.Tensor] = None,
+        cache_leftpad: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if any(v is not None for v in (cu_doc_lens, cu_doc_lens_q, cu_doc_lens_k, max_doc_len, max_doc_len_q, max_doc_len_k, local_k_slice, cache_leftpad)):
+            log.warning("GatedDeltaNetAttention ignores masking/cache args; using full causal sequence.")
+
+        B, T, _ = x.shape
+
+        q = self.w_q(x)
+        k = self.w_k(x)
+        v = self.w_v(x)
+        gate_logits = self.w_gate(x)
+
+        if self.clip_qkv is not None:
+            q.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
+            k.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
+            v.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
+
+        q = q.view(B, T, self.n_heads, self.head_dim)
+        k = k.view(B, T, self.n_kv_heads, self.head_dim)
+        v = v.view(B, T, self.n_kv_heads, self.head_dim)
+
+        if self.n_kv_heads == 1:
+            k = k.expand(-1, -1, self.n_heads, -1)
+            v = v.expand(-1, -1, self.n_heads, -1)
+
+        if self.q_norm is not None:
+            q = self.q_norm(q)
+        if self.k_norm is not None:
+            k = self.k_norm(k)
+
+        if self.rope is not None:
+            if pos_sin is not None or pos_cos is not None or freqs_cis is not None:
+                q, k = self.rope(
+                    q,
+                    k,
+                    head_first=False,
+                    pos_sin=pos_sin,
+                    pos_cos=pos_cos,
+                    freqs_cis=freqs_cis,
+                )
+            else:
+                q, k = self.rope(q, k, head_first=False)
+
+        gate = torch.sigmoid(gate_logits).view(B, T, self.n_heads, 1)
+
+        # state S: (B, H, D, D)
+        state = x.new_zeros(B, self.n_heads, self.head_dim, self.head_dim)
+        outputs = []
+        for t in range(T):
+            qt = q[:, t]  # (B,H,D)
+            kt = k[:, t]
+            vt = v[:, t]
+            at = gate[:, t].unsqueeze(-1)  # (B,H,1) -> (B,H,1,1) for broadcasting
+            state = at * state + torch.einsum("bhd,bhe->bhde", vt, kt)
+            ot = torch.einsum("bhde,bhe->bhd", state, qt)
+            outputs.append(ot)
+
+        out = torch.stack(outputs, dim=1).reshape(B, T, -1)
+        return self.w_out(out)
+
+    def apply_tp(
+        self,
+        tp_mesh: DeviceMesh,
+        input_layout: Optional[Placement] = None,
+        output_layout: Optional[Placement] = None,
+        use_local_output: bool = True,
+        float8_enabled: bool = False,
+    ):
+        del tp_mesh, input_layout, output_layout, use_local_output, float8_enabled
+        raise NotImplementedError("TP is not implemented for GatedDeltaNetAttention yet.")
+
+    def apply_cp(
+        self,
+        cp_mesh: DeviceMesh,
+        load_balancer: RingAttentionLoadBalancerType,
+        head_stride: int = 1,
+    ):
+        del cp_mesh, load_balancer, head_stride
+        raise NotImplementedError("CP is not implemented for GatedDeltaNetAttention yet.")
 
 
 @beta_feature
