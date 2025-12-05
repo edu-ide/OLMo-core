@@ -53,13 +53,13 @@
 │                                    │                                        │
 │                                    ▼                                        │
 │  ┌──────────────────────────────────────────────────────────────────────┐  │
-│  │  OUTPUT ACCELERATION (MTP / Block Diffusion)                         │  │
+│  │  OUTPUT: Block Diffusion (AR + Diffusion 하이브리드)                 │  │
 │  │  ════════════════════════════════════════════════════════════════════│  │
 │  │                                                                      │  │
-│  │   ┌─────────────────────┐    ┌─────────────────────┐                │  │
-│  │   │   MTP Head          │ OR │   Block Diffusion   │                │  │
-│  │   │   n개 토큰 동시 예측 │    │   AR+Diffusion 혼합 │                │  │
-│  │   └─────────────────────┘    └─────────────────────┘                │  │
+│  │   Block 1: [MASK] → Diffusion → [Tokens]   ← 블록 내 병렬 생성      │  │
+│  │   Block 2: [MASK] → Diffusion → [Tokens]   ← AR로 다음 블록         │  │
+│  │                                                                      │  │
+│  │   ✅ LaDiR과 동일한 Diffusion 패러다임으로 통일                      │  │
 │  │                                                                      │  │
 │  └──────────────────────────────────────────────────────────────────────┘  │
 │                                    │                                        │
@@ -175,12 +175,13 @@ M3 = Mamba-3, GD = Gated DeltaNet, GA = Gated Attention
 | **LaDiRDiffusion** | 생성 | Flow Matching |
 | **ProphetEarlyExit** | 가속 | Confidence gap 기반 조기 종료 |
 
-### Output Acceleration - "어떻게 출력?"
+### Output Generation - "어떻게 출력?"
 
-| 컴포넌트 | 파일 | 역할 | 속도 향상 |
-|---------|------|------|----------|
-| **MTP** | `mtp.py` | n개 토큰 동시 예측 | 2-3x |
-| **Block Diffusion** | `block_diffusion.py` | AR+Diffusion 하이브리드 | 2.5x (vs AR) |
+| 컴포넌트 | 파일 | 역할 | 특징 |
+|---------|------|------|------|
+| **Block Diffusion** | `block_diffusion.py` | AR+Diffusion 하이브리드 | ✅ 메인 (LaDiR과 통일) |
+
+> **선택 이유**: LaDiR과 동일한 Diffusion 패러다임 사용 → 아키텍처 일관성
 
 ---
 
@@ -234,11 +235,17 @@ Input Tokens
      │
      ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   OUTPUT GENERATION                             │
-│  ┌─────────────────────┐  ┌─────────────────────┐              │
-│  │   MTP Head          │  │   Block Diffusion    │              │
-│  │   (4 tokens/step)   │  │   (parallel blocks)  │              │
-│  └─────────────────────┘  └─────────────────────┘              │
+│                   OUTPUT: Block Diffusion                       │
+│  ┌────────────────────────────────────────────────────────────┐│
+│  │  AR between blocks + Diffusion within blocks               ││
+│  │                                                            ││
+│  │  Block 1: [MASK×4] → Denoise → [T₁ T₂ T₃ T₄]              ││
+│  │  Block 2: [MASK×4] → Denoise → [T₅ T₆ T₇ T₈]              ││
+│  │  ...                                                       ││
+│  │                                                            ││
+│  │  ✅ LaDiR과 동일한 Diffusion 패러다임                       ││
+│  │  ✅ 양방향 Attention으로 일관성 유지                        ││
+│  └────────────────────────────────────────────────────────────┘│
 └─────────────────────────────────────────────────────────────────┘
      │
      ▼
@@ -302,18 +309,21 @@ OLMo-core/src/olmo_core/nn/transformer/
 │       ├── LaDiRModule          (🆕 시퀀스 END에서 작동)
 │       └── LatentReasoningWrapper (🆕 ETD 출력 후 LaDiR 적용)
 │
-├── [OUTPUT ACCELERATION]
+├── [OUTPUT GENERATION]
 │   │
-│   ├── mtp.py                   # ✅ 기존 (Multi-Token Prediction)
-│   │   ├── MTPConfig
-│   │   ├── MTPHead
-│   │   ├── MTPLoss
-│   │   └── MTPSpeculativeDecoder
-│   │
-│   └── block_diffusion.py       # ✅ 기존 (Block Discrete Diffusion)
+│   └── block_diffusion.py       # ✅ 메인 (Block Discrete Diffusion)
 │       ├── BlockDiffusionConfig
-│       ├── NoiseSchedule
-│       └── BlockDiffusionLayer
+│       ├── NoiseSchedule (LogLinear, Cosine, Exp)
+│       ├── MaskDiffusion
+│       ├── BlockDiffusionDecoder
+│       └── BlockDiffusionWrapper
+│
+├── [OPTIONAL - 대안적 출력]
+│   │
+│   └── mtp.py                   # 대안 (속도 우선시)
+│       ├── MTPConfig
+│       ├── MTPHead
+│       └── MTPSpeculativeDecoder
 │
 ├── [CORE]
 │   ├── block.py                 # 기본 Transformer block
