@@ -15,6 +15,7 @@ from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from .config import RMSEConfig
 from .utils import RMSNorm
@@ -129,23 +130,19 @@ class RMSEDecoderLayer(nn.Module):
                 intermediate_size=config.intermediate_size,
             )
 
-    def forward(
+        # Gradient checkpointing (disabled by default)
+        self.gradient_checkpointing = False
+
+    def _forward_impl(
         self,
         hidden_states: torch.Tensor,
         current_ut: int = 0,
-        **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Forward pass: [HSA → SWA →] DeltaNet → MoE
-
-        Mamba2-NSA style: HSA and SWA are added BEFORE DeltaNet at certain layers.
-        Each component uses pre-norm + residual pattern.
-        """
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Internal forward implementation for gradient checkpointing."""
         total_aux_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
 
         # ===== 1. HSA-UltraLong (global sparse attention) =====
         if self.hsa is not None:
-            # HSA has internal pre_norm + residual
             hidden_states, _ = self.hsa(hidden_states)
 
         # ===== 2. Gated-SWA (local window attention) =====
@@ -156,8 +153,6 @@ class RMSEDecoderLayer(nn.Module):
             hidden_states = residual + hidden_states
 
         # ===== 3. GatedDeltaNet (linear attention) =====
-        # Note: FLA uses self.mode from init (set to 'chunk')
-        # Training requires seq_len > 64 due to FLA's automatic mode switching
         residual = hidden_states
         hidden_states = self.deltanet_norm(hidden_states)
         deltanet_output = self.deltanet(hidden_states)
@@ -174,6 +169,31 @@ class RMSEDecoderLayer(nn.Module):
             total_aux_loss = total_aux_loss + aux_loss
 
         return hidden_states, total_aux_loss
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        current_ut: int = 0,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Forward pass: [HSA → SWA →] DeltaNet → MoE
+
+        Mamba2-NSA style: HSA and SWA are added BEFORE DeltaNet at certain layers.
+        Each component uses pre-norm + residual pattern.
+        """
+        if self.gradient_checkpointing and self.training:
+            # Use gradient checkpointing to save memory
+            hidden_states, aux_loss = checkpoint(
+                self._forward_impl,
+                hidden_states,
+                current_ut,
+                use_reentrant=False,
+            )
+        else:
+            hidden_states, aux_loss = self._forward_impl(hidden_states, current_ut)
+
+        return hidden_states, aux_loss
 
 
 __all__ = ["RMSEDecoderLayer"]

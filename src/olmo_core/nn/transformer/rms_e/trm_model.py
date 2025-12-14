@@ -20,12 +20,16 @@ Reference:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 from typing import Optional, Tuple, Dict
 from dataclasses import dataclass
 
 from .config import RMSEConfig
 from .layer import RMSEDecoderLayer
 from .utils import RMSNorm  # Used for final output norm
+
+# [REQUIRED] Liger Kernel - Fused Linear + CE loss (2-3x memory reduction)
+from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
 
 
 @dataclass
@@ -140,6 +144,9 @@ class TRMStyleRMSE(nn.Module):
         # Tie weights
         self.lm_head.weight = self.embed_tokens.weight
 
+        # [REQUIRED] Liger Fused CE Loss - avoids materializing logits (2-3x memory savings)
+        self.liger_ce_loss = LigerFusedLinearCrossEntropyLoss(ignore_index=-100)
+
     def _init_carry(self, batch_size: int, seq_len: int, device: torch.device, dtype: torch.dtype) -> TRMCarry:
         """Initialize z_H and z_L states."""
         return TRMCarry(
@@ -182,6 +189,10 @@ class TRMStyleRMSE(nn.Module):
         q_halt_logits = None
         q_continue_logits = None
 
+        # Helper for checkpointed reasoning call
+        def _reasoning_step(state, injection):
+            return self.reasoning(state, input_injection=injection)
+
         for h_step in range(self.H_cycles):
             is_last_step = (h_step == self.H_cycles - 1)
 
@@ -192,12 +203,25 @@ class TRMStyleRMSE(nn.Module):
                 # Inner loop: Update z_L multiple times
                 for l_step in range(self.L_cycles):
                     injection = z_H + input_embeds
-                    z_L, aux = self.reasoning(z_L, input_injection=injection, **kwargs)
+                    if is_last_step and self.training:
+                        # Use gradient checkpointing to save memory
+                        z_L, aux = torch_checkpoint(
+                            _reasoning_step, z_L, injection,
+                            use_reentrant=False
+                        )
+                    else:
+                        z_L, aux = self.reasoning(z_L, input_injection=injection)
                     if is_last_step:
                         total_aux_loss += aux if aux is not None else 0.0
 
                 # Outer loop: Update z_H once using z_L
-                z_H, aux = self.reasoning(z_H, input_injection=z_L, **kwargs)
+                if is_last_step and self.training:
+                    z_H, aux = torch_checkpoint(
+                        _reasoning_step, z_H, z_L,
+                        use_reentrant=False
+                    )
+                else:
+                    z_H, aux = self.reasoning(z_H, input_injection=z_L)
                 if is_last_step:
                     total_aux_loss += aux if aux is not None else 0.0
 
@@ -226,18 +250,32 @@ class TRMStyleRMSE(nn.Module):
 
         # Output from z_H (high-level state)
         hidden_states = self.norm(z_H)
-        logits = self.lm_head(hidden_states)
 
-        # Compute loss if labels provided
+        # [OPTIMIZATION] Use Liger Fused CE Loss during training
+        # This avoids materializing the full [B, L, vocab_size] logits tensor
+        # Memory savings: ~10GB for 32K context with 150K vocab
         loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
+        if labels is not None and self.training:
+            # Fused: hidden_states -> lm_head -> CE loss (no intermediate logits)
+            shift_hidden = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, self.config.vocab_size),
-                shift_labels.view(-1),
-                ignore_index=-100
+            loss = self.liger_ce_loss(
+                shift_hidden.view(-1, hidden_states.size(-1)),
+                self.lm_head.weight,
+                shift_labels.view(-1)
             )
+            logits = None  # Not computed during training to save memory
+        else:
+            # Inference: need logits for generation
+            logits = self.lm_head(hidden_states)
+            if labels is not None:
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = labels[..., 1:].contiguous()
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, self.config.vocab_size),
+                    shift_labels.view(-1),
+                    ignore_index=-100
+                )
 
         return {
             "logits": logits,
@@ -324,7 +362,11 @@ class TRMStyleRMSEForCausalLM(nn.Module):
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory efficiency."""
-        # Apply to the reasoning block
-        if hasattr(self.model, 'reasoning') and hasattr(self.model.reasoning, 'block'):
-            if hasattr(self.model.reasoning.block, 'gradient_checkpointing_enable'):
-                self.model.reasoning.block.gradient_checkpointing_enable()
+        # Apply to all reasoning layers
+        if hasattr(self.model, 'reasoning') and hasattr(self.model.reasoning, 'layers'):
+            for layer in self.model.reasoning.layers:
+                if hasattr(layer, 'gradient_checkpointing_enable'):
+                    layer.gradient_checkpointing_enable()
+                layer.gradient_checkpointing = True
+        # Mark model as using gradient checkpointing
+        self._gradient_checkpointing = True
