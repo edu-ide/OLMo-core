@@ -290,16 +290,16 @@ class ChunkKVManager:
 
     def reorder(self, beam_ids):
         # warning: not tested!
-        self.chunk_k = self.chunk_k.index_select(0, beam_idx.to(self.chunk_k.device))
-        self.chunk_v = self.chunk_v.index_select(0, beam_idx.to(self.chunk_v.device))
-        self.lmk_embs = self.lmk_embs.index_select(0, beam_idx.to(self.lmk_embs.device))
+        self.chunk_k = self.chunk_k.index_select(0, beam_ids.to(self.chunk_k.device))
+        self.chunk_v = self.chunk_v.index_select(0, beam_ids.to(self.chunk_v.device))
+        self.lmk_embs = self.lmk_embs.index_select(0, beam_ids.to(self.lmk_embs.device))
 
         for group_i in range(self.group_size):
             self._current_chunk_k[group_i] = self._current_chunk_k[group_i].index_select(
-                0, beam_idx.to(self._current_chunk_k.device)
+                0, beam_ids.to(self._current_chunk_k[group_i].device)
             )
             self._current_chunk_v[group_i] = self._current_chunk_v[group_i].index_select(
-                0, beam_idx.to(self._current_chunk_v.device)
+                0, beam_ids.to(self._current_chunk_v[group_i].device)
             )
 
 class HSACache:

@@ -17,6 +17,7 @@ Reference:
 - Ouro: https://arxiv.org/abs/2510.25741
 """
 
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -306,7 +307,6 @@ class TRMStyleRMSE(nn.Module):
 
                 # During training: exploration (random early exit for Q-learning)
                 if self.training and h_step < self.H_cycles - 1:
-                    import random
                     if random.random() < self.act_exploration_prob:
                         # Random exploration: might halt early
                         min_steps = random.randint(1, self.H_cycles)
@@ -378,6 +378,10 @@ class TRMStyleRMSEForCausalLM(nn.Module):
             "aux_loss": outputs["aux_loss"],
             "z_H": outputs.get("z_H"),
             "z_L": outputs.get("z_L"),
+            # ACT outputs
+            "halt_step": outputs.get("halt_step"),
+            "q_halt_logits": outputs.get("q_halt_logits"),
+            "q_continue_logits": outputs.get("q_continue_logits"),
         }
 
     def generate(self, input_ids, max_new_tokens=100, temperature=1.0, top_k=50, **kwargs):

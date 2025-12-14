@@ -111,6 +111,3 @@ class RMSEConfig(Config):
     use_mtp: bool = True
     num_mtp_tokens: int = 1
     mtp_loss_weight: float = 0.3
-
-    # Normalization
-    rms_norm_eps: float = 1e-6
