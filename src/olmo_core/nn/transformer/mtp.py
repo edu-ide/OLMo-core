@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 from olmo_core.config import Config
 
@@ -89,6 +90,10 @@ class MTPConfig(Config):
 
     acceptance_threshold: float = 0.9
     """드래프트 토큰 수락 임계값 (nucleus)"""
+
+    # [OPTIMIZED] Gradient Checkpointing for MTP
+    use_gradient_checkpointing: bool = True
+    """MTP 헤드에 gradient checkpointing 적용 (메모리 절약)"""
 
     def __post_init__(self):
         if self.head_hidden_size == 0:
@@ -478,7 +483,13 @@ class MTPHead(nn.Module):
 
         # MTP 헤드 선택
         head_hidden_size = config.head_hidden_size or d_model
-        if config.mtp_head_type == "transformer":
+        if config.mtp_head_type == "medusa":
+            # Medusa-style: Stack of ResBlocks (zero-init for identity start)
+            self.mtp_head = nn.Sequential(
+                *[MedusaResBlock(d_model, dtype=dtype, init_device=init_device)
+                  for _ in range(config.head_num_layers)]
+            )
+        elif config.mtp_head_type == "transformer":
             self.mtp_head = MTPTransformerHead(
                 d_model=d_model,
                 num_heads=config.head_num_heads,
@@ -515,6 +526,30 @@ class MTPHead(nn.Module):
                 torch.ones(vocab_size, dtype=torch.bool),
             )
 
+    def _forward_step(
+        self,
+        h_k: torch.Tensor,
+        next_embeddings: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Single MTP step for gradient checkpointing.
+        Returns (h_k, logits) tuple.
+        """
+        # 입력 프로젝션: h^{k-1} + embed(t_{i+k})
+        h_k = self.projection(h_k, next_embeddings)
+
+        # MTP 헤드 통과
+        if isinstance(self.mtp_head, MTPTransformerHead):
+            h_k = self.mtp_head(h_k, attention_mask=attention_mask)
+        else:
+            h_k = self.mtp_head(h_k)
+
+        # Logits 계산
+        logits = self.lm_head(h_k)  # (B, T, V)
+
+        return h_k, logits
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -541,37 +576,36 @@ class MTPHead(nn.Module):
         # 현재 hidden states (k=0: trunk output)
         h_k = hidden_states
 
+        # [OPTIMIZED] Use gradient checkpointing if enabled
+        use_checkpoint = self.config.use_gradient_checkpointing and self.training
+
         for k in range(1, self.num_predict_tokens + 1):
             # 다음 토큰의 임베딩 가져오기 (t_{i+k})
-            # 학습 시: 실제 토큰 사용, 추론 시: 이전 예측 사용
             if k == 1:
-                # k=1: trunk의 h_i와 embed(t_{i+1})을 결합
-                # t_{i+1}은 input_ids[1:]에 해당
                 next_token_ids = input_ids[:, 1:]  # (B, T-1)
-                # 마지막 토큰은 다음 토큰이 없으므로 패딩
                 next_token_ids = F.pad(next_token_ids, (0, 1), value=0)
             else:
-                # k>1: 이전 스텝에서 예측한 토큰 사용
-                # 학습 시에는 teacher forcing 사용
                 offset = k
                 if offset < T:
                     next_token_ids = input_ids[:, offset:]
                     next_token_ids = F.pad(next_token_ids, (0, offset), value=0)
                 else:
-                    # 시퀀스 끝을 넘어가면 패딩
                     next_token_ids = torch.zeros_like(input_ids)
 
-            # 임베딩 가져오기
             next_embeddings = embeddings(next_token_ids)  # (B, T, E)
 
-            # 입력 프로젝션: h^{k-1} + embed(t_{i+k})
-            h_k = self.projection(h_k, next_embeddings)
-
-            # MTP 헤드 통과
-            h_k = self.mtp_head(h_k, attention_mask=attention_mask)
-
-            # Logits 계산
-            logits = self.lm_head(h_k)  # (B, T, V)
+            # [OPTIMIZED] Gradient Checkpointing for MTP Steps
+            if use_checkpoint:
+                # Checkpoint each MTP step to save VRAM
+                h_k, logits = torch.utils.checkpoint.checkpoint(
+                    self._forward_step,
+                    h_k,
+                    next_embeddings,
+                    attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                h_k, logits = self._forward_step(h_k, next_embeddings, attention_mask)
 
             # Vocabulary compression 적용 (optional)
             if self.vocab_mask is not None and self.config.use_vocab_compression:
@@ -906,7 +940,8 @@ class MTPSpeculativeDecoder:
             mask = cumsum - sorted_probs > top_p
             sorted_probs[mask] = 0
             sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-            probs = sorted_probs.scatter(-1, sorted_indices, sorted_probs)
+            # [FIX] Scatter back to original positions (must use new tensor)
+            probs = torch.zeros_like(probs).scatter(-1, sorted_indices, sorted_probs)
 
         return torch.multinomial(probs.squeeze(1), num_samples=1)
 

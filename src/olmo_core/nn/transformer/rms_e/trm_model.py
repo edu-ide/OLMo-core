@@ -28,8 +28,10 @@ from .config import RMSEConfig
 from .layer import RMSEDecoderLayer
 from .utils import RMSNorm  # Used for final output norm
 
-# [REQUIRED] Liger Kernel - Fused Linear + CE loss (2-3x memory reduction)
-from liger_kernel.transformers import LigerFusedLinearCrossEntropyLoss
+# Apple Cut Cross-Entropy - Memory efficient CE loss (works on Blackwell)
+# Paper: https://arxiv.org/abs/2411.09009
+# GitHub: https://github.com/apple/ml-cross-entropy
+from cut_cross_entropy import linear_cross_entropy
 
 
 @dataclass
@@ -144,8 +146,8 @@ class TRMStyleRMSE(nn.Module):
         # Tie weights
         self.lm_head.weight = self.embed_tokens.weight
 
-        # [REQUIRED] Liger Fused CE Loss - avoids materializing logits (2-3x memory savings)
-        self.liger_ce_loss = LigerFusedLinearCrossEntropyLoss(ignore_index=-100)
+        # CE chunk size for fallback (if CCE fails)
+        self.ce_chunk_size = getattr(config, 'ce_chunk_size', 512)
 
     def _init_carry(self, batch_size: int, seq_len: int, device: torch.device, dtype: torch.dtype) -> TRMCarry:
         """Initialize z_H and z_L states."""
@@ -153,6 +155,70 @@ class TRMStyleRMSE(nn.Module):
             z_H=self.H_init.view(1, 1, -1).expand(batch_size, seq_len, -1).to(dtype),
             z_L=self.L_init.view(1, 1, -1).expand(batch_size, seq_len, -1).to(dtype),
         )
+
+    def _chunked_cross_entropy(
+        self,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor,
+        chunk_size: int = 512
+    ) -> torch.Tensor:
+        """
+        Memory-efficient chunked cross-entropy loss.
+        Computes logits in chunks to avoid materializing full [B, L, V] tensor.
+
+        Args:
+            hidden_states: [B, L, D]
+            labels: [B, L]
+            chunk_size: Number of tokens to process at once
+
+        Returns:
+            Scalar loss
+        """
+        B, L, D = hidden_states.shape
+        V = self.config.vocab_size
+
+        # Shift for causal LM
+        shift_hidden = hidden_states[..., :-1, :].contiguous()  # [B, L-1, D]
+        shift_labels = labels[..., 1:].contiguous()  # [B, L-1]
+
+        # Flatten batch dimension
+        shift_hidden = shift_hidden.view(-1, D)  # [B*(L-1), D]
+        shift_labels = shift_labels.view(-1)  # [B*(L-1)]
+
+        total_tokens = shift_hidden.size(0)
+        total_loss = 0.0
+        num_valid_tokens = 0
+
+        # Process in chunks
+        for start_idx in range(0, total_tokens, chunk_size):
+            end_idx = min(start_idx + chunk_size, total_tokens)
+
+            chunk_hidden = shift_hidden[start_idx:end_idx]  # [chunk, D]
+            chunk_labels = shift_labels[start_idx:end_idx]  # [chunk]
+
+            # Compute logits for this chunk only
+            chunk_logits = F.linear(chunk_hidden, self.lm_head.weight)  # [chunk, V]
+
+            # Compute loss for this chunk (with reduction='none' for proper accumulation)
+            chunk_loss = F.cross_entropy(
+                chunk_logits,
+                chunk_labels,
+                ignore_index=-100,
+                reduction='none'
+            )
+
+            # Count valid tokens and accumulate loss
+            valid_mask = (chunk_labels != -100)
+            num_chunk_valid = valid_mask.sum().item()
+            if num_chunk_valid > 0:
+                total_loss = total_loss + chunk_loss[valid_mask].sum()
+                num_valid_tokens += num_chunk_valid
+
+        # Average over valid tokens
+        if num_valid_tokens > 0:
+            return total_loss / num_valid_tokens
+        else:
+            return torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
 
     def forward(
         self,
@@ -251,22 +317,18 @@ class TRMStyleRMSE(nn.Module):
         # Output from z_H (high-level state)
         hidden_states = self.norm(z_H)
 
-        # [OPTIMIZATION] Use Liger Fused CE Loss during training
-        # This avoids materializing the full [B, L, vocab_size] logits tensor
-        # Memory savings: ~10GB for 32K context with 150K vocab
+        # Compute logits and loss
+        # Use Apple CCE for memory efficiency (24GB -> 1MB for CE)
         loss = None
+        logits = None
+
         if labels is not None and self.training:
-            # Fused: hidden_states -> lm_head -> CE loss (no intermediate logits)
+            # Apple Cut Cross-Entropy: memory efficient, works on Blackwell
             shift_hidden = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
-            loss = self.liger_ce_loss(
-                shift_hidden.view(-1, hidden_states.size(-1)),
-                self.lm_head.weight,
-                shift_labels.view(-1)
-            )
-            logits = None  # Not computed during training to save memory
+            loss = linear_cross_entropy(shift_hidden, self.lm_head.weight, shift_labels)
         else:
-            # Inference: need logits for generation
+            # Inference or no labels: compute full logits
             logits = self.lm_head(hidden_states)
             if labels is not None:
                 shift_logits = logits[..., :-1, :].contiguous()

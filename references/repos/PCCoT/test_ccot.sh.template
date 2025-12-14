@@ -1,0 +1,25 @@
+#!/bin/bash
+echo "Start running..."
+export HF_ENDPOINT=https://hf-mirror.com
+
+accelerate launch test_ccot.py \
+    --model_name_or_path whynlp/pccot-gpt2 \
+    --dataset_name whynlp/gsm8k-aug \
+    --label_names labels \
+    --lora_target_modules c_attn-c_fc-c_proj \
+    --lora_modules_to_save "" \
+    --remove_unused_columns false \
+    --per_device_train_batch_size 64 \
+    --per_device_eval_batch_size 64 \
+    --auto_find_batch_size \
+    --block_size 1024 \
+    --attn_implementation flash_attention_2 \
+    --use_liger_kernel \
+    --bf16 \
+    --torch_dtype bfloat16 \
+    --do_eval \
+    --do_predict \
+    --report_to none \
+    --run_name pcot-gpt2-lora-test \
+    --overwrite_output_dir \
+    --output_dir outputs/pcot-gpt2-lora-test

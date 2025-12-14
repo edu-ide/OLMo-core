@@ -9,7 +9,7 @@ from ..config import Config, DType, StrEnum
 from ..exceptions import OLMoConfigurationError
 from .functional import l2_normalize
 
-__all__ = ["LayerNormType", "LayerNormConfig", "LayerNorm", "RMSNorm", "FusedRMSNorm", "L2Norm"]
+__all__ = ["LayerNormType", "LayerNormConfig", "LayerNorm", "RMSNorm", "ZeroCenteredRMSNorm", "FusedRMSNorm", "L2Norm"]
 
 
 class LayerNormType(StrEnum):
@@ -24,6 +24,10 @@ class LayerNormType(StrEnum):
     rms = "rms"
     """
     ➡️ :class:`RMSNorm`
+    """
+    zero_centered_rms = "zero_centered_rms"
+    """
+    ➡️ :class:`ZeroCenteredRMSNorm` (Qwen3-Next style)
     """
     fused_rms = "fused_rms"
     """
@@ -89,6 +93,8 @@ class LayerNormConfig(Config):
                 return LayerNorm(size=size, init_device=init_device, **kwargs)
             elif self.name == LayerNormType.rms:
                 return RMSNorm(size=size, init_device=init_device, **kwargs)
+            elif self.name == LayerNormType.zero_centered_rms:
+                return ZeroCenteredRMSNorm(size=size, init_device=init_device, **kwargs)
             elif self.name == LayerNormType.fused_rms:
                 return FusedRMSNorm(size=size, init_device=init_device, **kwargs)
             elif self.name == LayerNormType.l2_norm:
@@ -202,6 +208,44 @@ class RMSNorm(LayerNorm):
             if self.full_precision:
                 x = x.float()
 
+            variance = x.pow(2).mean(-1, keepdim=True)
+            x = x * torch.rsqrt(variance + self.eps)
+
+            if self.weight is not None:
+                if self.bias is not None:
+                    x = self.weight.type_as(x) * x + self.bias.type_as(x)
+                else:
+                    x = self.weight.type_as(x) * x
+
+            return x.to(og_dtype)
+
+
+class ZeroCenteredRMSNorm(RMSNorm):
+    """
+    Zero-Centered RMSNorm as used in Qwen3-Next for Q/K normalization.
+
+    Subtracts the mean before computing RMS normalization, which helps
+    with training stability for attention Q/K projections.
+
+    Reference: Qwen3-Next Architecture - Zero-Centered RMSNorm for Q/K
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Apply Zero-Centered RMSNorm.
+
+        :param x: The input.
+        """
+        with torch.autocast(enabled=False, device_type=x.device.type):
+            og_dtype = x.dtype
+
+            if self.full_precision:
+                x = x.float()
+
+            # Zero-centering: subtract mean
+            x = x - x.mean(-1, keepdim=True)
+
+            # Standard RMS normalization on centered input
             variance = x.pow(2).mean(-1, keepdim=True)
             x = x * torch.rsqrt(variance + self.eps)
 

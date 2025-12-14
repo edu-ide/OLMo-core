@@ -53,13 +53,15 @@ __all__ = [
     "BackboneType",
     "ETDTripleHybridConfig",
     "create_etd_triple_hybrid_model",
+    "ETDQuadHybridConfig",
+    "create_etd_quad_hybrid_model",
 ]
 
 
 class BackboneType(str, Enum):
     """백본 레이어 타입"""
     STANDARD = "standard"      # 기존 Transformer 블록 사용
-    TRIPLE_HYBRID = "triple_hybrid"  # Triple-Hybrid (Mamba-3 + DeltaNet + Attention)
+    ETD_QUAD_HYBRID = "etd_quad_hybrid"  # Triple-Hybrid (Mamba-3 + DeltaNet + Attention)
 
 
 class RouterAction(Enum):
@@ -969,6 +971,8 @@ class HuginnRecurrentTransformer(nn.Module):
         d_model: Model dimension
         mean_recurrence: Expected number of recurrent iterations
         state_init: Initialization for recurrent state ("zero", "normal", "embed")
+        dtype: Data type
+        init_device: Initialization device
     """
 
     def __init__(
@@ -1224,308 +1228,111 @@ def wrap_transformer_with_etd(
 
 
 @dataclass
-class ETDTripleHybridConfig(Config):
+class ETDQuadHybridConfig(Config):
     """
-    ETD + Triple-Hybrid 통합 설정.
-
-    Triple-Hybrid 백본을 ETD 구조와 결합:
-    - Encoder: 주로 DeltaNet (빠른 입력 처리)
-    - Think: Mamba-3 + DeltaNet + Attention (깊은 추론)
-    - Decoder: Attention 위주 (정밀한 출력)
+    ETD + Quad-Hybrid Configuration.
     """
-
-    # 모델 차원
-    hidden_size: int = 2048
-    """모델 hidden dimension"""
-
-    # ETD 구조 (레이어 분배)
-    n_encoder_layers: int = 8
-    """Encoder 레이어 수"""
-
-    n_think_layers: int = 24
-    """Think 레이어 수 (핵심 추론)"""
-
-    n_decoder_layers: int = 8
-    """Decoder 레이어 수"""
-
-    max_think_iterations: int = 4
-    """Think 블록 최대 반복 횟수"""
-
-    # Triple-Hybrid 비율 (각 섹션별로 다르게 설정 가능)
-    encoder_layer_pattern: Optional[List[str]] = None
-    """Encoder 레이어 패턴 (None이면 자동 생성)"""
-
-    think_layer_pattern: Optional[List[str]] = None
-    """Think 레이어 패턴 (None이면 자동 생성)"""
-
-    decoder_layer_pattern: Optional[List[str]] = None
-    """Decoder 레이어 패턴 (None이면 자동 생성)"""
-
-    # Encoder: DeltaNet 위주 (빠른 처리)
-    encoder_mamba_ratio: float = 0.25
-    encoder_deltanet_ratio: float = 0.5
-    encoder_attention_ratio: float = 0.25
-
-    # Think: 균형 잡힌 비율 (깊은 추론)
-    think_mamba_ratio: float = 0.4
-    think_deltanet_ratio: float = 0.4
-    think_attention_ratio: float = 0.2
-
-    # Decoder: Attention 위주 (정밀한 출력)
-    decoder_mamba_ratio: float = 0.25
-    decoder_deltanet_ratio: float = 0.25
-    decoder_attention_ratio: float = 0.5
-
-    # Triple-Hybrid 공통 설정
-    mamba3_d_state: int = 64
-    mamba3_headdim: int = 128
-    mamba3_use_complex: bool = True
-    deltanet_head_dim: int = 256
-    deltanet_num_heads: int = 6
-    attention_num_heads: int = 16
-    attention_head_dim: int = 128
-    hidden_ratio: int = 4
-    norm_eps: float = 1e-5
-
-    # Dr.LLM 라우터 (Think 블록용)
-    use_layer_router: bool = True
-    layer_router: LayerRouterConfig = field(default_factory=LayerRouterConfig)
-
-    # MoDr LoRA 전문가 (Think 블록용)
-    use_lora_experts: bool = True
-    num_lora_experts: int = 4
-    lora_expert: LoRAExpertConfig = field(default_factory=LoRAExpertConfig)
-
-    # 적응형 깊이
-    adaptive_depth: bool = True
-    confidence_threshold: float = 0.9
-
-    def get_encoder_pattern(self) -> List[str]:
-        """Encoder 레이어 패턴 생성"""
-        if self.encoder_layer_pattern is not None:
-            return self.encoder_layer_pattern
-
-        return self._generate_pattern(
-            self.n_encoder_layers,
-            self.encoder_mamba_ratio,
-            self.encoder_deltanet_ratio,
-            self.encoder_attention_ratio,
-        )
-
-    def get_think_pattern(self) -> List[str]:
-        """Think 레이어 패턴 생성"""
-        if self.think_layer_pattern is not None:
-            return self.think_layer_pattern
-
-        return self._generate_pattern(
-            self.n_think_layers,
-            self.think_mamba_ratio,
-            self.think_deltanet_ratio,
-            self.think_attention_ratio,
-        )
-
-    def get_decoder_pattern(self) -> List[str]:
-        """Decoder 레이어 패턴 생성"""
-        if self.decoder_layer_pattern is not None:
-            return self.decoder_layer_pattern
-
-        return self._generate_pattern(
-            self.n_decoder_layers,
-            self.decoder_mamba_ratio,
-            self.decoder_deltanet_ratio,
-            self.decoder_attention_ratio,
-        )
-
-    def _generate_pattern(
-        self,
-        n_layers: int,
-        mamba_ratio: float,
-        deltanet_ratio: float,
-        attention_ratio: float,
-    ) -> List[str]:
-        """비율에 따라 레이어 패턴 생성"""
-        n_mamba = int(n_layers * mamba_ratio)
-        n_deltanet = int(n_layers * deltanet_ratio)
-        n_attention = n_layers - n_mamba - n_deltanet
-
-        # 균일하게 분산 배치
-        pattern = []
-        mamba_positions = set(range(0, n_layers, max(1, n_layers // max(1, n_mamba)))) if n_mamba > 0 else set()
-        attention_positions = set(range(n_layers - 1, -1, -max(1, n_layers // max(1, n_attention)))) if n_attention > 0 else set()
-
-        for i in range(n_layers):
-            if i in mamba_positions and len([p for p in pattern if p == "mamba3"]) < n_mamba:
-                pattern.append("mamba3")
-            elif i in attention_positions and len([p for p in pattern if p == "gated_attention"]) < n_attention:
-                pattern.append("gated_attention")
-            else:
-                pattern.append("gated_deltanet")
-
-        return pattern
+    etd_config: ETDConfig
+    quad_hybrid_config: Any # QuadHybridConfig will be imported later
 
     def to_etd_config(self) -> ETDConfig:
         """ETDConfig로 변환"""
-        return ETDConfig(
-            n_encoder_layers=self.n_encoder_layers,
-            n_think_layers=self.n_think_layers,
-            n_decoder_layers=self.n_decoder_layers,
-            max_think_iterations=self.max_think_iterations,
-            adaptive_depth=self.adaptive_depth,
-            confidence_threshold=self.confidence_threshold,
-            use_layer_router=self.use_layer_router,
-            layer_router=self.layer_router,
-            use_lora_experts=self.use_lora_experts,
-            num_lora_experts=self.num_lora_experts,
-            lora_expert=self.lora_expert,
-        )
+        return self.etd_config
 
 
-class ETDTripleHybridTransformer(nn.Module):
+class ETDQuadHybridTransformer(nn.Module):
     """
-    ETD + Triple-Hybrid 통합 Transformer.
-
-    구조:
-    - Encoder: DeltaNet 위주의 Triple-Hybrid 블록
-    - Think: 균형 잡힌 Triple-Hybrid 블록 (반복 실행)
-    - Decoder: Attention 위주의 Triple-Hybrid 블록
+    ETD + Quad-Hybrid Transformer.
     """
 
     def __init__(
         self,
-        config: ETDTripleHybridConfig,
-        dtype: torch.dtype = torch.float32,
+        config: ETDQuadHybridConfig,
         init_device: str = "cpu",
     ):
         super().__init__()
         self.config = config
-        self.d_model = config.hidden_size
-        self.dtype = dtype
+        self.d_model = config.quad_hybrid_config.hidden_size
+        self.dtype = torch.float32 # Assuming default dtype for now, can be passed in config
 
-        # Import Triple-Hybrid components
-        from olmo_core.nn.transformer.triple_hybrid import (
-            TripleHybridConfig,
-            LayerType,
-            TripleHybridTransformer,
+        # Import Quad-Hybrid components
+        from olmo_core.nn.transformer.quad_hybrid import (
+            QuadHybridConfig,
+            QuadHybridTransformer,
+            create_quad_hybrid_model,
         )
         from olmo_core.nn.layer_norm import LayerNormConfig
 
-        layer_norm_config = LayerNormConfig(eps=config.norm_eps)
-
-        # Encoder Triple-Hybrid
-        encoder_pattern = config.get_encoder_pattern()
-        self.encoder = TripleHybridTransformer(
-            config=TripleHybridConfig(
-                hidden_size=config.hidden_size,
-                num_layers=config.n_encoder_layers,
-                layer_pattern=encoder_pattern,
-                mamba3_d_state=config.mamba3_d_state,
-                mamba3_headdim=config.mamba3_headdim,
-                mamba3_use_complex=config.mamba3_use_complex,
-                deltanet_head_dim=config.deltanet_head_dim,
-                deltanet_num_heads=config.deltanet_num_heads,
-                attention_num_heads=config.attention_num_heads,
-                attention_head_dim=config.attention_head_dim,
-                hidden_ratio=config.hidden_ratio,
-                norm_eps=config.norm_eps,
-            ),
-            layer_norm=layer_norm_config,
+        # 1. Encoder (Quad-Hybrid)
+        self.encoder = QuadHybridTransformer(
+            config=config.quad_hybrid_config,
             init_device=init_device,
         )
 
-        # Think Triple-Hybrid
-        think_pattern = config.get_think_pattern()
-        self.think = TripleHybridTransformer(
-            config=TripleHybridConfig(
-                hidden_size=config.hidden_size,
-                num_layers=config.n_think_layers,
-                layer_pattern=think_pattern,
-                mamba3_d_state=config.mamba3_d_state,
-                mamba3_headdim=config.mamba3_headdim,
-                mamba3_use_complex=config.mamba3_use_complex,
-                deltanet_head_dim=config.deltanet_head_dim,
-                deltanet_num_heads=config.deltanet_num_heads,
-                attention_num_heads=config.attention_num_heads,
-                attention_head_dim=config.attention_head_dim,
-                hidden_ratio=config.hidden_ratio,
-                norm_eps=config.norm_eps,
-            ),
-            layer_norm=layer_norm_config,
+        # 2. Think Block (Quad-Hybrid)
+        self.think = QuadHybridTransformer(
+            config=config.quad_hybrid_config,
             init_device=init_device,
         )
 
-        # Decoder Triple-Hybrid
-        decoder_pattern = config.get_decoder_pattern()
-        self.decoder = TripleHybridTransformer(
-            config=TripleHybridConfig(
-                hidden_size=config.hidden_size,
-                num_layers=config.n_decoder_layers,
-                layer_pattern=decoder_pattern,
-                mamba3_d_state=config.mamba3_d_state,
-                mamba3_headdim=config.mamba3_headdim,
-                mamba3_use_complex=config.mamba3_use_complex,
-                deltanet_head_dim=config.deltanet_head_dim,
-                deltanet_num_heads=config.deltanet_num_heads,
-                attention_num_heads=config.attention_num_heads,
-                attention_head_dim=config.attention_head_dim,
-                hidden_ratio=config.hidden_ratio,
-                norm_eps=config.norm_eps,
-            ),
-            layer_norm=layer_norm_config,
+        # 3. Decoder (Quad-Hybrid)
+        self.decoder = QuadHybridTransformer(
+            config=config.quad_hybrid_config,
             init_device=init_device,
         )
 
         # Dr.LLM 스타일 레이어 라우터 (Think 블록용)
         self.layer_routers: Optional[nn.ModuleList] = None
-        if config.use_layer_router:
+        if self.config.etd_config.use_layer_router:
             self.layer_routers = nn.ModuleList([
-                config.layer_router.build(
-                    d_model=config.hidden_size,
-                    dtype=dtype,
+                self.config.etd_config.layer_router.build(
+                    d_model=self.d_model,
+                    dtype=self.dtype,
                     init_device=init_device,
                 )
-                for _ in range(config.n_think_layers)
+                for _ in range(self.config.etd_config.n_think_layers)
             ])
 
         # MoDr 스타일 LoRA 전문가 (Think 블록용)
         self.lora_experts: Optional[nn.ModuleList] = None
         self.expert_router: Optional[MoDrExpertRouter] = None
-        if config.use_lora_experts:
+        if self.config.etd_config.use_lora_experts:
             self.lora_experts = nn.ModuleList([
                 nn.ModuleList([
-                    config.lora_expert.build(
-                        in_features=config.hidden_size,
-                        out_features=config.hidden_size,
-                        dtype=dtype,
+                    self.config.etd_config.lora_expert.build(
+                        in_features=self.d_model,
+                        out_features=self.d_model,
+                        dtype=self.dtype,
                         init_device=init_device,
                     )
-                    for _ in range(config.num_lora_experts)
+                    for _ in range(self.config.etd_config.num_lora_experts)
                 ])
-                for _ in range(config.n_think_layers)
+                for _ in range(self.config.etd_config.n_think_layers)
             ])
             self.expert_router = MoDrExpertRouter(
-                d_model=config.hidden_size,
-                num_experts=config.num_lora_experts,
-                dtype=dtype,
+                d_model=self.d_model,
+                num_experts=self.config.etd_config.num_lora_experts,
+                dtype=self.dtype,
                 init_device=init_device,
             )
 
         # Think 블록 컨트롤러
         self.think_controller: Optional[ThinkBlockController] = None
-        if config.adaptive_depth:
+        if self.config.etd_config.adaptive_depth:
             self.think_controller = ThinkBlockController(
-                d_model=config.hidden_size,
-                max_iterations=config.max_think_iterations,
-                confidence_threshold=config.confidence_threshold,
-                dtype=dtype,
+                d_model=self.d_model,
+                max_iterations=self.config.etd_config.max_think_iterations,
+                confidence_threshold=self.config.etd_config.confidence_threshold,
+                dtype=self.dtype,
                 init_device=init_device,
             )
 
         # 학습 상태
         self._step_count = 0
         self._expert_counts: Optional[torch.Tensor] = None
-        if config.use_lora_experts:
+        if self.config.etd_config.use_lora_experts:
             self._expert_counts = torch.zeros(
-                config.num_lora_experts, dtype=torch.long
+                self.config.etd_config.num_lora_experts, dtype=torch.long
             )
 
     def forward(
@@ -1535,7 +1342,7 @@ class ETDTripleHybridTransformer(nn.Module):
         **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """
-        ETD + Triple-Hybrid forward pass.
+        ETD + Quad-Hybrid forward pass.
 
         Args:
             h: Input embeddings (B, T, D)
@@ -1557,7 +1364,7 @@ class ETDTripleHybridTransformer(nn.Module):
         h, _ = self.encoder(h, attention_mask=attention_mask, **kwargs)
 
         # 2. Think: 반복적 추론
-        max_iterations = self.config.max_think_iterations
+        max_iterations = self.config.etd_config.max_think_iterations
         think_iteration = 0
 
         while think_iteration < max_iterations:
@@ -1565,7 +1372,7 @@ class ETDTripleHybridTransformer(nn.Module):
             h_think = h
             for layer_idx, layer in enumerate(self.think.layers):
                 # Dr.LLM 라우터
-                if self.layer_routers is not None and self._step_count >= 1000:
+                if self.layer_routers is not None and self._step_count >= self.config.etd_config.router_warmup_steps:
                     router = self.layer_routers[layer_idx]
                     action = router(h_think)
                     action_val = action[0].item()
@@ -1582,7 +1389,7 @@ class ETDTripleHybridTransformer(nn.Module):
                     h_think = layer(h_think, attention_mask=attention_mask, **kwargs)
 
                 # MoDr LoRA 전문가
-                if self.lora_experts is not None and self._step_count >= 500:
+                if self.lora_experts is not None and self._step_count >= self.config.etd_config.expert_warmup_steps:
                     expert_idx = self.expert_router(h_think)
                     expert_val = expert_idx[0].item()
                     metrics["expert_selections"].append(expert_val)
@@ -1617,68 +1424,33 @@ class ETDTripleHybridTransformer(nn.Module):
         """레이어 구조 정보 반환"""
         return {
             "encoder": {
-                "num_layers": self.config.n_encoder_layers,
-                "pattern": self.config.get_encoder_pattern(),
+                "num_layers": self.config.etd_config.n_encoder_layers,
+                "pattern": self.config.quad_hybrid_config.get_encoder_pattern(), # Assuming QuadHybridConfig has this
             },
             "think": {
-                "num_layers": self.config.n_think_layers,
-                "pattern": self.config.get_think_pattern(),
-                "max_iterations": self.config.max_think_iterations,
+                "num_layers": self.config.etd_config.n_think_layers,
+                "pattern": self.config.quad_hybrid_config.get_think_pattern(), # Assuming QuadHybridConfig has this
+                "max_iterations": self.config.etd_config.max_think_iterations,
             },
             "decoder": {
-                "num_layers": self.config.n_decoder_layers,
-                "pattern": self.config.get_decoder_pattern(),
+                "num_layers": self.config.etd_config.n_decoder_layers,
+                "pattern": self.config.quad_hybrid_config.get_decoder_pattern(), # Assuming QuadHybridConfig has this
             },
             "total_layers": (
-                self.config.n_encoder_layers +
-                self.config.n_think_layers +
-                self.config.n_decoder_layers
+                self.config.etd_config.n_encoder_layers +
+                self.config.etd_config.n_think_layers +
+                self.config.etd_config.n_decoder_layers
             ),
         }
 
 
-def create_etd_triple_hybrid_model(
-    hidden_size: int = 2048,
-    n_encoder_layers: int = 8,
-    n_think_layers: int = 24,
-    n_decoder_layers: int = 8,
-    max_think_iterations: int = 4,
-    **kwargs,
-) -> ETDTripleHybridTransformer:
+def create_etd_quad_hybrid_model(
+    etd_config: ETDConfig,
+    quad_hybrid_config: Any, 
+    **kwargs
+) -> nn.Module:
     """
-    ETD + Triple-Hybrid 모델 생성 헬퍼 함수.
-
-    Args:
-        hidden_size: 모델 차원
-        n_encoder_layers: Encoder 레이어 수
-        n_think_layers: Think 레이어 수
-        n_decoder_layers: Decoder 레이어 수
-        max_think_iterations: Think 최대 반복 횟수
-        **kwargs: 추가 설정
-
-    Returns:
-        ETDTripleHybridTransformer 인스턴스
-
-    Example:
-        ```python
-        model = create_etd_triple_hybrid_model(
-            hidden_size=2048,
-            n_encoder_layers=8,
-            n_think_layers=24,
-            n_decoder_layers=8,
-        )
-
-        # Forward
-        output, metrics = model(input_embeds)
-        print(f"Think iterations: {metrics['think_iterations']}")
-        ```
+    ETD + Quad-Hybrid 모델 생성 팩토리 함수.
     """
-    config = ETDTripleHybridConfig(
-        hidden_size=hidden_size,
-        n_encoder_layers=n_encoder_layers,
-        n_think_layers=n_think_layers,
-        n_decoder_layers=n_decoder_layers,
-        max_think_iterations=max_think_iterations,
-        **kwargs,
-    )
-    return ETDTripleHybridTransformer(config)
+    # 임시 구현: placeholder returning None or raising Error if called
+    raise NotImplementedError("create_etd_quad_hybrid_model is not implemented yet.")

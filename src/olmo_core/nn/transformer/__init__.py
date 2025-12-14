@@ -30,11 +30,11 @@ from .etd import (
     RouterAction,
     ThinkBlockController,
     wrap_transformer_with_etd,
-    # ETD + Triple-Hybrid Integration
+    # ETD + Quad-Hybrid Integration
     BackboneType,
-    ETDTripleHybridConfig,
-    ETDTripleHybridTransformer,
-    create_etd_triple_hybrid_model,
+    ETDQuadHybridConfig,
+    ETDQuadHybridTransformer,
+    create_etd_quad_hybrid_model,
 )
 from .init import InitMethod
 from .model import MoETransformer, NormalizedTransformer, Transformer
@@ -49,6 +49,13 @@ from .qwen3_next_wrapper import (
     Qwen3NextConfig,
     Qwen3NextWrapper,
     create_qwen3_next_model,
+)
+from .gated_attention import (
+    GatedAttention,
+    GatedAttentionConfig,
+    GatedAttentionBlock,
+    GatedAttentionBlockMoE,
+    RotaryEmbedding,
 )
 from .dna_transfer import (
     # Upcycling
@@ -137,18 +144,29 @@ from .mamba_memory import (
     MambaMemoryConfig,
     MambaMemoryBlock,
 )
-from .triple_hybrid import (
+from .quad_hybrid import (
     # Config
-    TripleHybridConfig,
+    QuadHybridConfig,
     LayerType,
     GatedAttentionConfig,
     # Core modules
     GatedAttention,
     GatedAttentionBlock,
-    TripleHybridTransformer,
+    QuadHybridTransformer,
     # Utilities
-    create_triple_hybrid_model,
+    create_quad_hybrid_model,
     analyze_layer_distribution,
+)
+from .atlas_memory import (
+    # Config
+    ATLASConfig,
+    # Core ATLAS components (직접 구현)
+    PolynomialKernel,
+    DeepMLPMemory,
+    OmegaRule,
+    MuonOptimizer,
+    ATLASMemory,
+    ATLASBlock,
 )
 
 __all__ = [
@@ -185,11 +203,11 @@ __all__ = [
     "RouterAction",
     "ThinkBlockController",
     "wrap_transformer_with_etd",
-    # ETD + Triple-Hybrid Integration
+    # ETD + Quad-Hybrid Integration
     "BackboneType",
-    "ETDTripleHybridConfig",
-    "ETDTripleHybridTransformer",
-    "create_etd_triple_hybrid_model",
+    "ETDQuadHybridConfig",
+    "ETDQuadHybridTransformer",
+    "create_etd_quad_hybrid_model",
     # MTP (Multi-Token Prediction)
     "MTPConfig",
     "MTPHead",
@@ -268,13 +286,25 @@ __all__ = [
     "MambaMemory",
     "MambaMemoryConfig",
     "MambaMemoryBlock",
-    # Triple-Hybrid (Mamba-3 + GatedDeltaNet + GatedAttention)
-    "TripleHybridConfig",
+    # Quad-Hybrid (ATLAS + Mamba-3 + GatedDeltaNet + GatedAttention)
+    "QuadHybridConfig",
     "LayerType",
     "GatedAttentionConfig",
     "GatedAttention",
     "GatedAttentionBlock",
-    "TripleHybridTransformer",
-    "create_triple_hybrid_model",
+    "QuadHybridTransformer",
+    "create_quad_hybrid_model",
     "analyze_layer_distribution",
+    # ATLAS Neural Long-term Memory (10M+ 토큰, 직접 구현)
+    "ATLASConfig",
+    "QuadHybridConfig",
+    "PolynomialKernel",
+    "DeepMLPMemory",
+    "OmegaRule",
+    "MuonOptimizer",
+    "ATLASMemory",
+    "ATLASBlock",
+    # Quad-Hybrid (ATLAS + Mamba-3 + DeltaNet + Attention)
+    "QuadHybridTransformer",
+    "create_quad_hybrid_model",
 ]

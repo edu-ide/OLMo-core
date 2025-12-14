@@ -1,0 +1,1264 @@
+
+╭─── Claude Code v2.0.58 ──────────────────────────────────────────────────────╮
+│                                         │ Tips for getting started           │
+│          Welcome back Yeo Won!          │ Run /init to create a CLAUDE.md f… │
+│                                         │ ────────────────────────────────── │
+│                 ▐▛███▜▌                 │ Recent activity                    │
+│                ▝▜█████▛▘                │ No recent activity                 │
+│                  ▘▘ ▝▝                  │                                    │
+│                                         │                                    │
+│          Opus 4.5 · Claude Max          │                                    │
+│   ~/ws/llm/OLMo-core/references/repos   │                                    │
+╰──────────────────────────────────────────────────────────────────────────────╯
+══════════════════ Conversation compacted · ctrl+o for history ═════════════════
+  ⎿  Referenced file ../../src/olmo_core/nn/transformer/etd.py
+  ⎿  Referenced file ../../src/olmo_core/nn/transformer/mtp.py
+  ⎿  Referenced file ../../src/olmo_core/nn/transformer/latent_reasoning.py
+  ⎿  Read iDUS/src/iDUS.py (77 lines)
+  ⎿ Read mergekit/mergekit/merge_methods/generalized_task_arithmetic.py (255 
+    lines)
+  ⎿  Todo list read (6 items)
+
+● Continuing with ETD update. Let me first read the current state of etd.py
+  and the Huginn reference code.
+
+● Read(~/ws/llm/OLMo-core/src/olmo_core/nn/transformer/etd.py)
+  ⎿  Read 797 lines
+
+● Read(huginn/src/model/huginn.py)
+  ⎿  Error reading file
+
+● Let me find the Huginn reference repo:
+
+● Search(pattern: "**/huginn/**/*.py", path:
+        "~/ws/llm/OLMo-core/references/repos")
+  ⎿  Found 60 files (ctrl+o to expand)
+
+● Read(huginn/recpre/model_dynamic.py)
+  ⎿  Read 1493 lines
+
+● Read(huginn/recpre/raven_modeling_minimal.py)
+  ⎿  Error: File content (32965 tokens) exceeds maximum allowed tokens (25000). 
+     Please use offset and limit parameters to read specific portions of the 
+     file, or use the GrepTool to search for specific content.
+
+● Let me search for the HuginnDynamicCache pattern:
+
+● Search(pattern: "DynamicCache|HuginnCache|class.*Cache", path: "huginn",
+        output_mode: "content")
+  ⎿  Found 20 lines (ctrl+o to expand)
+
+● Read(huginn/recpre/raven_modeling_minimal.py)
+  ⎿  Read 500 lines
+
+● Now I have the complete reference from Huginn. Let me add the Huginn-style
+   components to etd.py:
+
+● Update(~/ws/llm/OLMo-core/src/olmo_core/nn/transformer/etd.py)
+  ⎿  Updated ../../src/olmo_core/nn/transformer/etd.py with 386 additions
+        704            self._router_stats = {"skip": [], "execute": [], 
+              "repeat": []}
+        705    
+        706    
+        707 +  # ========================================================
+            + =====================
+        708 +  # Huginn-style Components (from 
+            + seal-rg/recurrent-pretraining reference)
+        709 +  # ========================================================
+            + =====================
+        710 +  
+        711 +  
+        712 +  class HuginnDynamicCache:
+        713 +      """
+        714 +      Huginn-style step-aware KV cache.
+        715 +  
+        716 +      Stores KV cache per recurrent step, enabling different
+            +  lookup strategies
+        717 +      for recurrent transformers. Based on 
+            + recpre/raven_modeling_minimal.py.
+        718 +  
+        719 +      Args:
+        720 +          lookup_strategy: Strategy for handling missing 
+            + entries
+        721 +              - "full": Materialize all entries (default)
+        722 +              - "latest-m4": Use latest entry with modulo-4 
+            + step matching
+        723 +              - "skip": Only use entries that exist
+        724 +      """
+        725 +  
+        726 +      def __init__(self, lookup_strategy: str = "full") -> 
+            + None:
+        727 +          self._seen_tokens = 0
+        728 +          # Structure: cache[step_idx][seq_position] = 
+            + tensor
+        729 +          self.key_cache: Dict[int, Dict[int, torch.Tensor]]
+            +  = {}
+        730 +          self.value_cache: Dict[int, Dict[int, 
+            + torch.Tensor]] = {}
+        731 +          self.lookup_strategy = lookup_strategy
+        732 +  
+        733 +      def update(
+        734 +          self,
+        735 +          key_states: torch.Tensor,
+        736 +          value_states: torch.Tensor,
+        737 +          step_idx: int,
+        738 +          lookup_strategy: Optional[str] = None,
+        739 +      ) -> Tuple[torch.Tensor, torch.Tensor]:
+        740 +          """
+        741 +          Update cache and return materialized past states.
+        742 +  
+        743 +          Args:
+        744 +              key_states: New key states [B, num_heads, 
+            + seq_len, head_dim]
+        745 +              value_states: New value states [B, num_heads, 
+            + seq_len, head_dim]
+        746 +              step_idx: Current step index (layer or 
+            + recurrent iteration)
+        747 +              lookup_strategy: Override default lookup 
+            + strategy
+        748 +  
+        749 +          Returns:
+        750 +              Tuple of (past_keys, past_values) tensors
+        751 +          """
+        752 +          lookup_strategy = lookup_strategy or 
+            + self.lookup_strategy
+        753 +  
+        754 +          # Initialize cache for this step if needed
+        755 +          if step_idx not in self.key_cache:
+        756 +              self.key_cache[step_idx] = {}
+        757 +              self.value_cache[step_idx] = {}
+        758 +  
+        759 +          # Track tokens seen (only count on step 0)
+        760 +          if step_idx == 0:
+        761 +              self._seen_tokens += key_states.shape[-2]
+        762 +  
+        763 +          # Add entries to cache
+        764 +          start_pos = self._seen_tokens - 
+            + key_states.shape[-2]
+        765 +          for idx, (k_entry, v_entry) in enumerate(
+        766 +              zip(key_states.unbind(dim=-2), 
+            + value_states.unbind(dim=-2))
+        767 +          ):
+        768 +              pos = start_pos + idx
+        769 +              self.key_cache[step_idx][pos] = k_entry
+        770 +              self.value_cache[step_idx][pos] = v_entry
+        771 +  
+        772 +          # Materialize based on strategy
+        773 +          if lookup_strategy == "full" or 
+            + len(self.key_cache[step_idx]) == self._seen_tokens:
+        774 +              return (
+        775 +                  
+            + torch.stack(list(self.key_cache[step_idx].values()), 
+            + dim=-2),
+        776 +                  
+            + torch.stack(list(self.value_cache[step_idx].values()), 
+            + dim=-2),
+        777 +              )
+        778 +          elif lookup_strategy.startswith("latest-m4"):
+        779 +              # Use latest entry matching modulo-4 pattern 
+            + (Huginn block structure)
+        780 +              latest_keys, latest_values = [], []
+        781 +              for pos in range(self._seen_tokens):
+        782 +                  if step_idx >= 2:
+        783 +                      valid_steps = [s for s in 
+            + range(step_idx + 1) if pos in self.key_cache.get(s, {})]
+        784 +                      max_step = max([s for s in valid_steps
+            +  if s >= 2 and s % 4 == step_idx % 4], default=0)
+        785 +                  else:
+        786 +                      max_step = step_idx if pos in 
+            + self.key_cache[step_idx] else 0
+        787 +                  
+            + latest_keys.append(self.key_cache[max_step][pos])
+        788 +                  
+            + latest_values.append(self.value_cache[max_step][pos])
+        789 +              return torch.stack(latest_keys, dim=-2), 
+            + torch.stack(latest_values, dim=-2)
+        790 +          elif lookup_strategy == "skip":
+        791 +              # Only return entries that exist
+        792 +              existing_keys = [self.key_cache[step_idx][pos]
+            +  for pos in range(self._seen_tokens)
+        793 +                             if pos in 
+            + self.key_cache[step_idx]]
+        794 +              existing_values = 
+            + [self.value_cache[step_idx][pos] for pos in 
+            + range(self._seen_tokens)
+        795 +                               if pos in 
+            + self.value_cache[step_idx]]
+        796 +              return torch.stack(existing_keys, dim=-2), 
+            + torch.stack(existing_values, dim=-2)
+        797 +          else:
+        798 +              raise ValueError(f"Unknown lookup strategy: 
+            + {lookup_strategy}")
+        799 +  
+        800 +      def reset(self) -> None:
+        801 +          """Reset the cache state."""
+        802 +          self._seen_tokens = 0
+        803 +          self.key_cache.clear()
+        804 +          self.value_cache.clear()
+        805 +  
+        806 +      def get_seq_length(self, step_idx: int = 0) -> int:
+        807 +          """Return number of tokens seen."""
+        808 +          return self._seen_tokens
+        809 +  
+        810 +  
+        811 +  class SandwichBlock(nn.Module):
+        812 +      """
+        813 +      Huginn-style Sandwich Block with 4 layer norms.
+        814 +  
+        815 +      Unlike standard pre-norm or post-norm, this uses:
+        816 +      - norm_1 before attention, norm_2 after attention 
+            + residual
+        817 +      - norm_3 before MLP, norm_4 after MLP residual
+        818 +  
+        819 +      Pattern:
+        820 +          x = norm_2(attn(norm_1(x)) + x)
+        821 +          x = norm_4(mlp(norm_3(x)) + x)
+        822 +  
+        823 +      This provides better gradient flow and stability for 
+            + recurrent models.
+        824 +      Based on recpre/model_dynamic.py SandwichBlock.
+        825 +      """
+        826 +  
+        827 +      def __init__(
+        828 +          self,
+        829 +          *,
+        830 +          d_model: int,
+        831 +          attention: nn.Module,
+        832 +          mlp: nn.Module,
+        833 +          norm_eps: float = 1e-6,
+        834 +          dtype: torch.dtype = torch.float32,
+        835 +          init_device: str = "cpu",
+        836 +      ):
+        837 +          super().__init__()
+        838 +          self.d_model = d_model
+        839 +  
+        840 +          # 4 layer norms (sandwich pattern)
+        841 +          self.norm_1 = nn.RMSNorm(d_model, eps=norm_eps, 
+            + device=init_device)
+        842 +          self.norm_2 = nn.RMSNorm(d_model, eps=norm_eps, 
+            + device=init_device)
+        843 +          self.norm_3 = nn.RMSNorm(d_model, eps=norm_eps, 
+            + device=init_device)
+        844 +          self.norm_4 = nn.RMSNorm(d_model, eps=norm_eps, 
+            + device=init_device)
+        845 +  
+        846 +          self.attn = attention
+        847 +          self.mlp = mlp
+        848 +  
+        849 +      def forward(
+        850 +          self,
+        851 +          x: torch.Tensor,
+        852 +          **kwargs,
+        853 +      ) -> torch.Tensor:
+        854 +          """
+        855 +          Sandwich forward pass.
+        856 +  
+        857 +          Args:
+        858 +              x: Input tensor [B, T, D]
+        859 +              **kwargs: Additional arguments for attention 
+            + (mask, freqs_cis, etc.)
+        860 +          """
+        861 +          # Attention with sandwich norms
+        862 +          x = self.norm_2(self.attn(self.norm_1(x), 
+            + **kwargs) + x)
+        863 +          # MLP with sandwich norms
+        864 +          x = self.norm_4(self.mlp(self.norm_3(x)) + x)
+        865 +          return x
+        866 +  
+        867 +  
+        868 +  class HuginnAdapter(nn.Module):
+        869 +      """
+        870 +      Huginn-style adapter for combining recurrent state 
+            + with input embeddings.
+        871 +  
+        872 +      Based on recpre/model_dynamic.py injection_type 
+            + options:
+        873 +      - "linear": Linear projection of concatenated [state, 
+            + input]
+        874 +      - "ffn": MLP projection of concatenated [state, input]
+        875 +      - "add": Simple addition
+        876 +      - "gate": Element-wise multiplication (gating)
+        877 +  
+        878 +      Args:
+        879 +          d_model: Model dimension
+        880 +          injection_type: Type of injection ("linear", 
+            + "ffn", "add", "gate")
+        881 +          dtype: Data type
+        882 +          init_device: Initialization device
+        883 +      """
+        884 +  
+        885 +      def __init__(
+        886 +          self,
+        887 +          *,
+        888 +          d_model: int,
+        889 +          injection_type: str = "linear",
+        890 +          intermediate_size: Optional[int] = None,
+        891 +          dtype: torch.dtype = torch.float32,
+        892 +          init_device: str = "cpu",
+        893 +      ):
+        894 +          super().__init__()
+        895 +          self.d_model = d_model
+        896 +          self.injection_type = injection_type
+        897 +  
+        898 +          if injection_type == "linear":
+        899 +              self.adapter = nn.Linear(
+        900 +                  d_model * 2, d_model, bias=False,
+        901 +                  dtype=dtype, device=init_device
+        902 +              )
+        903 +          elif injection_type == "ffn":
+        904 +              intermediate = intermediate_size or d_model * 
+            + 4
+        905 +              self.adapter = nn.Sequential(
+        906 +                  nn.Linear(d_model * 2, intermediate, 
+            + bias=False, dtype=dtype, device=init_device),
+        907 +                  nn.SiLU(),
+        908 +                  nn.Linear(intermediate, d_model, 
+            + bias=False, dtype=dtype, device=init_device),
+        909 +              )
+        910 +          elif injection_type in ("add", "gate"):
+        911 +              self.adapter = nn.Identity()
+        912 +          else:
+        913 +              raise ValueError(f"Unknown injection_type: 
+            + {injection_type}")
+        914 +  
+        915 +      def forward(
+        916 +          self,
+        917 +          state: torch.Tensor,
+        918 +          input_embeds: torch.Tensor,
+        919 +      ) -> torch.Tensor:
+        920 +          """
+        921 +          Combine recurrent state with input embeddings.
+        922 +  
+        923 +          Args:
+        924 +              state: Recurrent state [B, T, D]
+        925 +              input_embeds: Input embeddings [B, T, D]
+        926 +  
+        927 +          Returns:
+        928 +              Combined representation [B, T, D]
+        929 +          """
+        930 +          if self.injection_type == "linear" or 
+            + self.injection_type == "ffn":
+        931 +              return self.adapter(torch.cat([state, 
+            + input_embeds], dim=-1))
+        932 +          elif self.injection_type == "add":
+        933 +              return state + input_embeds
+        934 +          elif self.injection_type == "gate":
+        935 +              return state * input_embeds
+        936 +          else:
+        937 +              return self.adapter(state)
+        938 +  
+        939 +  
+        940 +  class HuginnRecurrentTransformer(nn.Module):
+        941 +      """
+        942 +      Huginn-style Recurrent Transformer.
+        943 +  
+        944 +      Architecture: Prelude → Adapter → Core Block 
+            + (recurrent) → Coda
+        945 +  
+        946 +      Based on recpre/model_dynamic.py RecurrentGPT:
+        947 +      - Prelude: Initial non-recurrent layers
+        948 +      - Adapter: Combines recurrent state with input 
+            + embeddings
+        949 +      - Core Block: Recurrent layers (repeated N times)
+        950 +      - Coda: Final non-recurrent layers
+        951 +  
+        952 +      Args:
+        953 +          prelude_blocks: Initial transformer blocks
+        954 +          core_blocks: Recurrent transformer blocks
+        955 +          coda_blocks: Final transformer blocks
+        956 +          adapter: HuginnAdapter for state injection
+        957 +          d_model: Model dimension
+        958 +          mean_recurrence: Expected number of recurrent 
+            + iterations
+        959 +          state_init: Initialization for recurrent state 
+            + ("zero", "normal", "embed")
+        960 +      """
+        961 +  
+        962 +      def __init__(
+        963 +          self,
+        964 +          *,
+        965 +          prelude_blocks: nn.ModuleList,
+        966 +          core_blocks: nn.ModuleList,
+        967 +          coda_blocks: nn.ModuleList,
+        968 +          adapter: HuginnAdapter,
+        969 +          d_model: int,
+        970 +          mean_recurrence: int = 8,
+        971 +          mean_backprop_depth: int = 4,
+        972 +          state_init: str = "zero",
+        973 +          dtype: torch.dtype = torch.float32,
+        974 +          init_device: str = "cpu",
+        975 +      ):
+        976 +          super().__init__()
+        977 +          self.prelude = prelude_blocks
+        978 +          self.core_block = core_blocks
+        979 +          self.coda = coda_blocks
+        980 +          self.adapter = adapter
+        981 +          self.d_model = d_model
+        982 +          self.mean_recurrence = mean_recurrence
+        983 +          self.mean_backprop_depth = mean_backprop_depth
+        984 +          self.state_init = state_init
+        985 +  
+        986 +          # Final norm
+        987 +          self.ln_f = nn.RMSNorm(d_model, eps=1e-6, 
+            + device=init_device)
+        988 +  
+        989 +          # Training state
+        990 +          self._step = 0
+        991 +  
+        992 +      def forward(
+        993 +          self,
+        994 +          input_embeds: torch.Tensor,
+        995 +          num_steps: Optional[int] = None,
+        996 +          **block_kwargs,
+        997 +      ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        998 +          """
+        999 +          Forward pass with recurrent iteration.
+       1000 +  
+       1001 +          Args:
+       1002 +              input_embeds: Input embeddings [B, T, D]
+       1003 +              num_steps: Override number of recurrent steps
+       1004 +              **block_kwargs: Arguments for transformer 
+            + blocks
+       1005 +  
+       1006 +          Returns:
+       1007 +              output: Final hidden states [B, T, D]
+       1008 +              metrics: Training metrics
+       1009 +          """
+       1010 +          metrics: Dict[str, Any] = {
+       1011 +              "num_steps_no_grad": 0,
+       1012 +              "num_steps_with_grad": 0,
+       1013 +          }
+       1014 +  
+       1015 +          # Prelude
+       1016 +          x = input_embeds
+       1017 +          for block in self.prelude:
+       1018 +              x = block(x, **block_kwargs)
+       1019 +  
+       1020 +          # Initialize recurrent state
+       1021 +          state = self._initialize_state(input_embeds)
+       1022 +  
+       1023 +          # Determine iterations
+       1024 +          if num_steps is not None:
+       1025 +              n_no_grad, n_with_grad = num_steps, 0
+       1026 +          elif self.training:
+       1027 +              n_no_grad, n_with_grad = 
+            + self._sample_iterations()
+       1028 +          else:
+       1029 +              n_no_grad, n_with_grad = self.mean_recurrence,
+            +  0
+       1030 +  
+       1031 +          metrics["num_steps_no_grad"] = n_no_grad
+       1032 +          metrics["num_steps_with_grad"] = n_with_grad
+       1033 +  
+       1034 +          # Recurrent iterations without gradient
+       1035 +          with torch.no_grad():
+       1036 +              for _ in range(n_no_grad):
+       1037 +                  state = self._core_forward(state, x, 
+            + **block_kwargs)
+       1038 +  
+       1039 +          # Recurrent iterations with gradient
+       1040 +          for _ in range(n_with_grad):
+       1041 +              state = self._core_forward(state, x, 
+            + **block_kwargs)
+       1042 +  
+       1043 +          # Apply final norm to recurrent output
+       1044 +          x = self.ln_f(state)
+       1045 +  
+       1046 +          # Coda
+       1047 +          for block in self.coda:
+       1048 +              x = block(x, **block_kwargs)
+       1049 +  
+       1050 +          self._step += 1
+       1051 +          return x, metrics
+       1052 +  
+       1053 +      def _core_forward(
+       1054 +          self,
+       1055 +          state: torch.Tensor,
+       1056 +          input_embeds: torch.Tensor,
+       1057 +          **block_kwargs,
+       1058 +      ) -> torch.Tensor:
+       1059 +          """Single iteration of core block."""
+       1060 +          # Combine state with input via adapter
+       1061 +          x = self.adapter(state, input_embeds)
+       1062 +  
+       1063 +          # Apply core blocks
+       1064 +          for block in self.core_block:
+       1065 +              x = block(x, **block_kwargs)
+       1066 +  
+       1067 +          return x
+       1068 +  
+       1069 +      def _initialize_state(self, input_embeds: 
+            + torch.Tensor) -> torch.Tensor:
+       1070 +          """Initialize recurrent state."""
+       1071 +          if self.state_init == "zero":
+       1072 +              return torch.zeros_like(input_embeds)
+       1073 +          elif self.state_init == "normal":
+       1074 +              return torch.randn_like(input_embeds)
+       1075 +          elif self.state_init == "embed":
+       1076 +              # Scaled like embeddings
+       1077 +              return torch.randn_like(input_embeds) / 
+            + math.sqrt(input_embeds.shape[-1])
+       1078 +          else:
+       1079 +              return torch.zeros_like(input_embeds)
+       1080 +  
+       1081 +      def _sample_iterations(self) -> Tuple[int, int]:
+       1082 +          """Sample number of iterations for training 
+            + (Huginn-style)."""
+       1083 +          t = max(self.mean_recurrence - 
+            + self.mean_backprop_depth, 0)
+       1084 +          s = self.mean_backprop_depth
+       1085 +  
+       1086 +          # Simple uniform sampling (can be extended with 
+            + other schemes)
+       1087 +          n = torch.randint(0, 2 * t + 1, (1,)).item() if t 
+            + > 0 else 0
+       1088 +          k = torch.randint(1, 2 * s + 1, (1,)).item()
+       1089 +  
+       1090 +          return int(n), int(k)
+       1091 +  
+       1092 +  
+       1093    def wrap_transformer_with_etd(
+       1094        transformer: nn.Module,
+       1095        etd_config: ETDConfig,
+
+● ETD updated with Huginn patterns. Now let me update the todo and proceed
+  to MoE with DeepSeek-V3 patterns:
+
+● Search(pattern: "**/moe*.py", path: "~/ws/llm/OLMo-core/src/olmo_core")
+  ⎿  Found 3 files (ctrl+o to expand)
+
+● Search(pattern: "class.*MoE|shared_expert|route_scale", path: "DeepSeek-V3",
+        output_mode: "content")
+  ⎿  Found 20 lines (ctrl+o to expand)
+
+● Read(DeepSeek-V3/inference/model.py)
+  ⎿  Read 200 lines
+
+● Read(~/ws/llm/OLMo-core/src/olmo_core/nn/moe/moe.py)
+  ⎿  Read 418 lines
+
+● Let me check the MoE router for route_scale and score function options:
+
+● Read(~/ws/llm/OLMo-core/src/olmo_core/nn/moe/router.py)
+  ⎿  Read 572 lines
+
+● The OLMo-core MoE already has sigmoid gating and bias_gamma
+  (auxiliary-loss-free balancing). The main missing feature is route_scale.
+  Let me add that:
+
+● Update(~/ws/llm/OLMo-core/src/olmo_core/nn/moe/router.py)
+  ⎿  Updated ../../src/olmo_core/nn/moe/router.py with 21 additions      
+       79    class MoERouterConfig(Config):
+       80        """
+       81        A configuration class for easily building any of the 
+            different MoE router modules.
+       82 +  
+       83 +      DeepSeek-V3 reference (inference/model.py):
+       84 +      - route_scale: Scaling factor applied to routing weights
+          +  after top-k selection
+       85 +      - score_func: Either 'softmax' or 'sigmoid' for routing 
+          + score computation
+       86 +      - bias: Auxiliary-loss-free load balancing via learnable
+          +  bias
+       87        """
+       88    
+       89        name: MoERouterType = MoERouterType.default
+     ...
+        92        bias_gamma: Optional[float] = None
+        93        gating_function: MoERouterGatingFunction = 
+             MoERouterGatingFunction.softmax
+        94        dtype: Optional[DType] = None
+        95 +      route_scale: float = 1.0
+        96 +      """
+        97 +      DeepSeek-V3 style route scaling. Applied to expert 
+           + weights after selection.
+        98 +      Default 1.0 (no scaling). Typical values: 2.5 for 671B,
+           +  16.0 for 236B.
+        99 +      Reference: DeepSeek-V3/inference/model.py line 597 - 
+           + weights *= self.route_scale
+       100 +      """
+       101 +      n_expert_groups: int = 1
+       102 +      """
+       103 +      Number of expert groups for hierarchical routing 
+           + (DeepSeek-V3 n_groups).
+       104 +      When > 1, routes to top-k groups first, then selects 
+           + experts within groups.
+       105 +      """
+       106 +      n_limited_groups: Optional[int] = None
+       107 +      """
+       108 +      Number of groups to limit routing to (DeepSeek-V3 
+           + topk_groups).
+       109 +      Only used when n_expert_groups > 1. Defaults to 1 if 
+           + not set.
+       110 +      """
+       111    
+       112        def num_params(self, d_model: int, num_experts: int) ->
+              int:
+       113            """
+
+● Now let me update the MoERouter class to use route_scale:
+
+● Update(~/ws/llm/OLMo-core/src/olmo_core/nn/moe/router.py)
+  ⎿  Updated ../../src/olmo_core/nn/moe/router.py with 7 additions       
+       186        :param bias_gamma: If set to a positive float, experts 
+             scores for top-k routing will be adjusted
+       187            by a bias following the "auxiliary-loss-free load 
+             balancing" strategy from DeepSeek-v3.
+       188            A reasonable value is on the order of 0.0001.
+       189 +      :param route_scale: DeepSeek-V3 style scaling factor 
+           + applied to expert weights after selection.
+       190 +          Default 1.0 (no scaling). Reference: 
+           + DeepSeek-V3/inference/model.py line 597.
+       191 +      :param n_expert_groups: Number of expert groups for 
+           + hierarchical routing (DeepSeek-V3).
+       192 +      :param n_limited_groups: Number of groups to limit 
+           + routing to when using expert groups.
+       193        """
+       194    
+       195        def __init__(
+     ...
+       203            lb_loss_granularity: 
+             MoELoadBalancingLossGranularity = 
+             MoELoadBalancingLossGranularity.local_batch,
+       204            z_loss_weight: Optional[float] = None,
+       205            init_device: str = "cpu",
+       206 +          route_scale: float = 1.0,
+       207 +          n_expert_groups: int = 1,
+       208 +          n_limited_groups: Optional[int] = None,
+       209        ):
+       210            super().__init__()
+       211            self.d_model = d_model
+
+● Update(~/ws/llm/OLMo-core/src/olmo_core/nn/moe/router.py)
+  ⎿  Updated ../../src/olmo_core/nn/moe/router.py with 4 additions  
+       226            self.group: Optional[dist.ProcessGroup] = None
+       227            self.cp_mesh: Optional[dist.DeviceMesh] = None
+       228            self.tp_mesh: Optional[dist.DeviceMesh] = None
+       229 +          # DeepSeek-V3 style parameters
+       230 +          self.route_scale = route_scale
+       231 +          self.n_expert_groups = n_expert_groups
+       232 +          self.n_limited_groups = n_limited_groups if 
+           + n_limited_groups is not None else 1
+       233    
+       234            if self.bias_gamma is not None:
+       235                assert self.bias_gamma > 0
+
+● Now let me update the forward method to apply route_scale and expert
+  groups:
+
+● Read(~/ws/llm/OLMo-core/src/olmo_core/nn/moe/router.py)
+  ⎿  Read 100 lines
+
+● Update(~/ws/llm/OLMo-core/src/olmo_core/nn/moe/router.py)
+  ⎿  Updated ../../src/olmo_core/nn/moe/router.py with 5 additions     
+       485                    )
+       486                )
+       487    
+       488 +          # DeepSeek-V3 style route scaling
+       489 +          # Reference: DeepSeek-V3/inference/model.py line 
+           + 597 - weights *= self.route_scale
+       490 +          if self.route_scale != 1.0:
+       491 +              expert_weights = expert_weights * 
+           + self.route_scale
+       492 +  
+       493            with torch.no_grad():
+       494                # Histogram the expert ids to identify the 
+             number of items/tokens routed to each expert.
+       495                # shape: (batch_size, seq_len, num_experts)
+
+● Now let me add expert group routing support. First, let me update the
+  get_top_k method:
+
+● Update(~/ws/llm/OLMo-core/src/olmo_core/nn/moe/router.py)
+  ⎿  Updated ../../src/olmo_core/nn/moe/router.py with 55 additions and 12 
+     removals
+       368                return x * (low + noise * (high - low))
+       369    
+       370        def get_top_k(self, scores: torch.Tensor) -> 
+             Tuple[torch.Tensor, torch.Tensor]:
+       371 +          """
+       372 +          Get top-k expert weights and indices.
+       373 +  
+       374 +          Supports DeepSeek-V3 style hierarchical routing 
+           + when n_expert_groups > 1:
+       375 +          1. Score each expert group
+       376 +          2. Select top-k groups
+       377 +          3. Mask out experts in non-selected groups
+       378 +          4. Select top-k experts from remaining
+       379 +  
+       380 +          Reference: DeepSeek-V3/inference/model.py lines 
+           + 584-598
+       381 +          """
+       382            expert_weights: torch.Tensor
+       383            expert_indices: torch.Tensor
+       384 -          if self.bias_gamma is None:
+       385 -              if self.top_k == 1:
+       386 -                  expert_weights, expert_indices = 
+           - scores.max(dim=-1, keepdim=True)
+       387 -              else:
+       388 -                  expert_weights, expert_indices = 
+           - torch.topk(scores, self.top_k, dim=-1)
+       389 -          else:
+       384 +  
+       385 +          # Original scores for final weight gathering
+       386 +          original_scores = scores
+       387 +  
+       388 +          # Add bias if using auxiliary-loss-free load 
+           + balancing
+       389 +          if self.bias_gamma is not None:
+       390                assert self.score_bias is not None
+       391 -              with torch.no_grad():
+       392 -                  _, expert_indices = torch.topk(
+       393 -                      scores + self.score_bias.unsqueeze(0), 
+           - self.top_k, dim=-1  # type: ignore
+       394 -                  )
+       395 -              expert_weights = scores.gather(-1, 
+           - expert_indices)
+       391 +              scores = scores + self.score_bias.unsqueeze(0) 
+           +  # type: ignore
+       392    
+       393 +          # DeepSeek-V3 style expert group routing
+       394 +          # Reference: DeepSeek-V3/inference/model.py lines 
+           + 584-592
+       395 +          if self.n_expert_groups > 1:
+       396 +              # Reshape to [batch_size, seq_len, n_groups, 
+           + experts_per_group]
+       397 +              experts_per_group = self.num_experts // 
+           + self.n_expert_groups
+       398 +              scores_grouped = 
+           + scores.view(*scores.shape[:-1], self.n_expert_groups, 
+           + experts_per_group)
+       399 +  
+       400 +              # Get group scores (max within each group)
+       401 +              group_scores = scores_grouped.amax(dim=-1)  # 
+           + [batch_size, seq_len, n_groups]
+       402 +  
+       403 +              # Select top-k groups
+       404 +              _, group_indices = torch.topk(group_scores, 
+           + self.n_limited_groups, dim=-1)
+       405 +  
+       406 +              # Create mask for non-selected groups
+       407 +              group_mask = torch.ones_like(group_scores, 
+           + dtype=torch.bool)
+       408 +              group_mask.scatter_(-1, group_indices, False)
+       409 +  
+       410 +              # Apply mask to expert scores (set non-selected
+           +  groups to -inf)
+       411 +              group_mask = 
+           + group_mask.unsqueeze(-1).expand_as(scores_grouped)
+       412 +              scores_grouped = 
+           + scores_grouped.masked_fill(group_mask, float("-inf"))
+       413 +              scores = scores_grouped.flatten(-2)  # Back to 
+           + [batch_size, seq_len, num_experts]
+       414 +  
+       415 +          # Select top-k experts
+       416 +          if self.top_k == 1:
+       417 +              _, expert_indices = scores.max(dim=-1, 
+           + keepdim=True)
+       418 +          else:
+       419 +              _, expert_indices = torch.topk(scores, 
+           + self.top_k, dim=-1)
+       420 +  
+       421 +          # Gather weights from original scores (without 
+           + bias)
+       422 +          expert_weights = original_scores.gather(-1, 
+           + expert_indices)
+       423 +  
+       424 +          # For sigmoid scoring, normalize weights to sum to 
+           + 1
+       425 +          # Reference: DeepSeek-V3/inference/model.py lines 
+           + 595-596
+       426 +          if self.gating_function == 
+           + MoERouterGatingFunction.sigmoid:
+       427 +              expert_weights = expert_weights / 
+           + (expert_weights.sum(dim=-1, keepdim=True) + 1e-7)
+       428 +  
+       429            if self.uniform_expert_assignment:
+       430                expert_indices = 
+             _uniform_expert_assignment(expert_indices, self.num_experts)
+       431 -              expert_weights = scores
+           -  .gather(-1, expert_indices)
+       431 +              expert_weights = original_scores
+           +  .gather(-1, expert_indices)
+       432    
+       433            return expert_weights, expert_indices
+       434    
+
+● MoE updated with DeepSeek-V3 patterns. Now let me update the todo and
+  proceed to DNA Transfer:
+
+● Search(pattern: "**/dna*transfer*.py", path:
+        "~/ws/llm/OLMo-core/src/olmo_core")
+  ⎿  Found 1 file (ctrl+o to expand)
+
+● Read(iDUS/src/iDUS.py)
+  ⎿  Read 77 lines
+
+● Read(~/ws/llm/OLMo-core/src/olmo_core/nn/transformer/dna_transfer.py)
+  ⎿  Read 1392 lines
+
+● Let me add iDUS patterns and mergekit-style task arithmetic to
+  dna_transfer.py:
+
+● Update(~/ws/llm/OLMo-core/src/olmo_core/nn/transformer/dna_transfer.py)
+  ⎿  Updated ../../src/olmo_core/nn/transformer/dna_transfer.py with 88  
+     additions and 1 removal
+       334        log.info(f"Upcycled {ffn_name} to MoE with 
+             {config.num_experts} experts")
+       335    
+       336    
+       337 +  class IDUSType(Enum):
+       338 +      """
+       339 +      iDUS (Interlocking Depth-Up-Scaling) 유형.
+       340 +  
+       341 +      Reference: gauss5930/iDUS 
+           + (https://github.com/gauss5930/iDUS)
+       342 +  
+       343 +      - ORIGINAL: Solar DUS - 레이어 범위를 단순 연결 (0-24) 
+           + + (8-32)
+       344 +      - INTERLOCKED_1: 각 레이어를 교차 삽입 (A0, B0, A1, B1,
+           +  ...)
+       345 +      - INTERLOCKED_8: 8개 그룹 단위로 교차 (0-8) + (8-16)*2 
+           + + (16-24)*2 + (24-32)
+       346 +      """
+       347 +      ORIGINAL = "original"
+       348 +      INTERLOCKED_1 = "interlocked_1"
+       349 +      INTERLOCKED_8 = "interlocked_8"
+       350 +  
+       351 +  
+       352 +  def get_idus_layer_arrangement(
+       353 +      n_layers: int,
+       354 +      idus_type: IDUSType = IDUSType.ORIGINAL,
+       355 +      overlap_start: int = 8,
+       356 +  ) -> List[int]:
+       357 +      """
+       358 +      iDUS 스타일 레이어 배열 생성.
+       359 +  
+       360 +      Reference: gauss5930/iDUS/src/iDUS.py
+       361 +  
+       362 +      Args:
+       363 +          n_layers: 원본 모델의 레이어 수 (예: 32)
+       364 +          idus_type: iDUS 유형
+       365 +          overlap_start: 중첩 시작 레이어 (기본 8, Solar 
+           + 방식)
+       366 +  
+       367 +      Returns:
+       368 +          새로운 레이어 배열 (인덱스 리스트)
+       369 +  
+       370 +      Example:
+       371 +          ```python
+       372 +          # Original DUS (Solar 10.7B style): 32 → 48 layers
+       373 +          arrangement = get_idus_layer_arrangement(32, 
+           + IDUSType.ORIGINAL)
+       374 +          # [0, 1, ..., 23, 8, 9, ..., 31]
+       375 +  
+       376 +          # iDUS-1layer: 32 → 48 layers (interleaved)
+       377 +          arrangement = get_idus_layer_arrangement(32, 
+           + IDUSType.INTERLOCKED_1)
+       378 +          # [0, 8, 1, 9, 2, 10, ..., 23, 31]
+       379 +          ```
+       380 +      """
+       381 +      if idus_type == IDUSType.ORIGINAL:
+       382 +          # Solar DUS: 첫 부분 + 중첩 시작부터 끝까지
+       383 +          # Reference: iDUS.py line 38
+       384 +          first_range = list(range(0, n_layers - 
+           + overlap_start))
+       385 +          second_range = list(range(overlap_start, n_layers))
+       386 +          return first_range + second_range
+       387 +  
+       388 +      elif idus_type == IDUSType.INTERLOCKED_1:
+       389 +          # iDUS-1layer: 각 레이어를 하나씩 교차
+       390 +          # Reference: iDUS.py lines 39-45
+       391 +          layer_arrangement = []
+       392 +          layer_A = list(range(0, n_layers - overlap_start))
+       393 +          layer_B = list(range(overlap_start, n_layers))
+       394 +          for i in range(len(layer_A)):
+       395 +              layer_arrangement.append(layer_A[i])
+       396 +              layer_arrangement.append(layer_B[i])
+       397 +          return layer_arrangement
+       398 +  
+       399 +      elif idus_type == IDUSType.INTERLOCKED_8:
+       400 +          # iDUS-8layer: 8개 그룹 단위로 교차
+       401 +          # Reference: iDUS.py line 48
+       402 +          # (0-8) + (8-16)*2 + (16-24)*2 + (24-32)
+       403 +          group_size = overlap_start  # 8
+       404 +          n_groups = n_layers // group_size  # 4 for 32 
+           + layers
+       405 +  
+       406 +          arrangement = list(range(0, group_size))  # First 
+           + group
+       407 +          for g in range(1, n_groups - 1):
+       408 +              start = g * group_size
+       409 +              end = start + group_size
+       410 +              arrangement.extend(list(range(start, end)) * 2)
+           +   # Repeat middle groups
+       411 +          arrangement.extend(list(range(n_layers - 
+           + group_size, n_layers)))  # Last group
+       412 +  
+       413 +          return arrangement
+       414 +  
+       415 +      else:
+       416 +          raise ValueError(f"Unknown iDUS type: {idus_type}")
+       417 +  
+       418 +  
+       419    @dataclass
+       420    class DepthUpscaleConfig(Config):
+       421        """
+       422        Depth Up-Scaling (DUS) 설정.
+       423    
+       424        Solar 스타일: 레이어를 복제하여 모델 깊이 증가.
+       425 +  
+       426 +      Reference: gauss5930/iDUS for interlocking patterns.
+       427        """
+       428    
+       429        scale_factor: int = 2
+       430        """깊이 배율 (2x = 레이어 수 2배)"""
+       431    
+       432        insertion_method: str = "interleave"
+       433 -      """삽입 방식: 'interleave' (교차 삽입), 'stack' (위에 
+           -  쌓기)"""
+       433 +      """삽입 방식: 'interleave' (교차 삽입), 'stack' (위에 
+           +  쌓기), 'idus_original', 'idus_interlocked_1', 
+           +  'idus_interlocked_8'"""
+       434    
+       435        init_noise: float = 0.001
+       436        """복제된 레이어의 초기화 노이즈"""
+     ...
+       354        skip_embed_and_head: bool = True
+       355        """임베딩과 LM head는 복제하지 않음"""
+       356    
+       357 +      idus_overlap_start: int = 8
+       358 +      """iDUS 모드에서 중첩 시작 레이어 (Solar는 8 사용)"""
+       359    
+       360 +  
+       361    def depth_upscale(
+       362        model: nn.Module,
+       363        config: DepthUpscaleConfig,
+
+● Now let me update the depth_upscale function to support iDUS:
+
+● Update(~/ws/llm/OLMo-core/src/olmo_core/nn/transformer/dna_transfer.py)
+  ⎿  Updated ../../src/olmo_core/nn/transformer/dna_transfer.py with 26 
+     additions
+       503                        _add_noise_to_module(cloned, 
+             config.init_noise)
+       504                    new_layers.append(cloned)
+       505    
+       506 +      elif config.insertion_method.startswith("idus_"):
+       507 +          # iDUS 스타일 배열
+       508 +          # Reference: gauss5930/iDUS
+       509 +          idus_type_str = 
+           + config.insertion_method.replace("idus_", "")
+       510 +          idus_type = IDUSType(idus_type_str)
+       511 +  
+       512 +          arrangement = get_idus_layer_arrangement(
+       513 +              n_original,
+       514 +              idus_type=idus_type,
+       515 +              overlap_start=config.idus_overlap_start,
+       516 +          )
+       517 +  
+       518 +          log.info(f"iDUS arrangement ({idus_type.value}): 
+           + {n_original} → {len(arrangement)} layers")
+       519 +  
+       520 +          for new_idx, old_idx in enumerate(arrangement):
+       521 +              if old_idx < len(original_layers):
+       522 +                  if new_idx < n_original:
+       523 +                      # 원본 레이어 재사용
+       524 +                      
+           + new_layers.append(original_layers[old_idx])
+       525 +                  else:
+       526 +                      # 복제된 레이어
+       527 +                      cloned = 
+           + copy.deepcopy(original_layers[old_idx])
+       528 +                      if config.init_noise > 0:
+       529 +                          _add_noise_to_module(cloned, 
+           + config.init_noise)
+       530 +                      new_layers.append(cloned)
+       531 +  
+       532        # 레이어 교체
+       533        _replace_layers(model, layer_container_name, 
+             new_layers)
+       534    
+
+● Now let me add mergekit-style sparsification methods. First let me update
+  the exports and add the sparsification:
+
+● Update(~/ws/llm/OLMo-core/src/olmo_core/nn/transformer/dna_transfer.py)
+  ⎿  Updated ../../src/olmo_core/nn/transformer/dna_transfer.py with 9     
+     additions and 1 removal
+       37        "UpcyclingConfig",
+       38        "upcycle_dense_to_moe",
+       39        "depth_upscale",
+       40 +      # iDUS (Interlocking Depth-Up-Scaling)
+       41 +      "IDUSType",
+       42 +      "get_idus_layer_arrangement",
+       43 +      "DepthUpscaleConfig",
+       44        # Model Growth
+       45        "ModelGrowthConfig",
+       46        "GrowthMethod",
+     ...
+       46        "ModelSlicingConfig",
+       47        "slice_model",
+       48        "create_model_family",
+       49 -      # Evolutionary Merge
+       49 +      # Evolutionary Merge (with mergekit-style 
+          + sparsification)
+       50        "EvolutionaryMergeConfig",
+       51        "evolutionary_merge",
+       52        "MergeStrategy",
+       53 +      "SparsificationMethod",
+       54 +      "ConsensusMethod",
+       55 +      "sparsify_delta",
+       56 +      "get_consensus_mask",
+       57    ]
+       58    
+       59    
+
+● Now let me add the mergekit-style sparsification and consensus methods:
+
+● Update(~/ws/llm/OLMo-core/src/olmo_core/nn/transformer/dna_transfer.py)
+  ⎿  Updated ../../src/olmo_core/nn/transformer/dna_transfer.py with 166 
+     additions and 1 removal
+       1139    
+       1140    
+       1141    # ========================================================
+              =====================
+       1142 -  # 4. EVOLUTIONARY MODEL MERGE
+       1142 +  # 4. EVOLUTIONARY MODEL MERGE
+            +   (with mergekit-style sparsification)
+       1143    # ========================================================
+              =====================
+       1144    
+       1145 +  class SparsificationMethod(Enum):
+       1146 +      """
+       1147 +      Sparsification methods for model merging.
+       1148 +  
+       1149 +      Reference: mergekit/sparsify.py, 
+            + mergekit/merge_methods/generalized_task_arithmetic.py
+       1150 +      """
+       1151 +      NONE = "none"
+       1152 +      MAGNITUDE = "magnitude"          # Keep top-k by 
+            + absolute value
+       1153 +      RANDOM = "random"                # Random pruning
+       1154 +      MAGNITUDE_OUTLIERS = "magnitude_outliers"  # 
+            + Outlier-based (uses gamma)
+       1155 +      DELLA_MAGPRUNE = "della_magprune"  # DELLA magnitude 
+            + pruning (uses epsilon)
+       1156 +  
+       1157 +  
+       1158 +  class ConsensusMethod(Enum):
+       1159 +      """
+       1160 +      Consensus methods for determining which delta values 
+            + to keep.
+       1161 +  
+       1162 +      Reference: 
+            + mergekit/merge_methods/generalized_task_arithmetic.py
+       1163 +      - COUNT: Majority vote by count of signs
+       1164 +      - SUM: Weighted vote by sum of values
+       1165 +      """
+       1166 +      COUNT = "count"
+       1167 +      SUM = "sum"
+       1168 +  
+       1169 +  
+       1170 +  def sparsify_delta(
+       1171 +      delta: torch.Tensor,
+       1172 +      density: float = 1.0,
+       1173 +      method: SparsificationMethod = 
+            + SparsificationMethod.MAGNITUDE,
+       1174 +      rescale: bool = True,
+       1175 +      gamma: float = 0.01,
+       1176 +      epsilon: float = 0.15,
+       1177 +  ) -> torch.Tensor:
+       1178 +      """
+       1179 +      Sparsify a delta tensor (task vector).
+       1180 +  
+       1181 +      Reference: mergekit/sparsify.py
+       1182 +  
+       1183 +      Args:
+       1184 +          delta: The delta tensor to sparsify
+       1185 +          density: Fraction of values to keep (0.0 to 1.0)
+       1186 +          method: Sparsification method
+       1187 +          rescale: Whether to rescale to preserve L1 norm
+       1188 +          gamma: Outlier threshold for magnitude_outliers
+       1189 +          epsilon: Epsilon for della_magprune
+       1190 +  
+       1191 +      Returns:
+       1192 +          Sparsified delta tensor
+       1193 +  
+       1194 +      Example:
+       1195 +          ```python
+       1196 +          # Keep top 50% by magnitude
+       1197 +          sparse_delta = sparsify_delta(delta, density=0.5, 
+            + method=SparsificationMethod.MAGNITUDE)
+       1198 +  
+       1199 +          # Random pruning with 30% density
+       1200 +          sparse_delta = sparsify_delta(delta, density=0.3, 
+            + method=SparsificationMethod.RANDOM)
+       1201 +          ```
+       1202 +      """
+       1203 +      if density >= 1.0 or method == 
+            + SparsificationMethod.NONE:
+       1204 +          return delta
+       1205 +  
+       1206 +      original_norm = delta.abs().sum() if rescale else None
+       1207 +  
+       1208 +      if method == SparsificationMethod.MAGNITUDE:
+       1209 +          # Keep top-k by absolute value
+       1210 +          threshold = torch.quantile(delta.abs().flatten(), 
+            + 1 - density)
+       1211 +          mask = delta.abs() >= threshold
+       1212 +          result = delta * mask
+       1213 +  
+       1214 +      elif method == SparsificationMethod.RANDOM:
+       1215 +          # Random pruning
+       1216 +          mask = torch.rand_like(delta) < density
+       1217 +          result = delta * mask
+       1218 +  
+       1219 +      elif method == 
+            + SparsificationMethod.MAGNITUDE_OUTLIERS:
+       1220 +          # Outlier-based: keep values outside gamma 
+            + percentile
+       1221 +          # Reference: mergekit gamma parameter
+       1222 +          lower = torch.quantile(delta.flatten(), gamma)
+       1223 +          upper = torch.quantile(delta.flatten(), 1 - gamma)
+       1224 +          mask = (delta < lower) | (delta > upper)
+       1225 +          # Also apply density threshold
+       1226 +          if density < 1.0:
+       1227 +              magnitudes = delta.abs()
+       1228 +              threshold = 
+            + torch.quantile(magnitudes[mask].flatten(), 1 - density)
+       1229 +              mask = mask & (magnitudes >= threshold)
+       1230 +          result = delta * mask
+       1231 +  
+       1232 +      elif method == SparsificationMethod.DELLA_MAGPRUNE:
+       1233 +          # DELLA-style magnitude pruning with epsilon
+       1234 +          # Reference: mergekit epsilon parameter
+       1235 +          magnitudes = delta.abs()
+       1236 +          mean_mag = magnitudes.mean()
+       1237 +          threshold = mean_mag * (1 + epsilon)
+       1238 +          # Keep values above threshold, then apply density
+       1239 +          above_threshold = magnitudes >= threshold
+       1240 +          if above_threshold.sum() > delta.numel() * 
+            + density:
+       1241 +              # Need additional pruning
+       1242 +              values_above = magnitudes[above_threshold]
+       1243 +              top_threshold = 
+            + torch.quantile(values_above.flatten(), 1 - density)
+       1244 +              mask = above_threshold & (magnitudes >= 
+            + top_threshold)
+       1245 +          else:
+       1246 +              mask = above_threshold
+       1247 +          result = delta * mask
+       1248 +  
+       1249 +      else:
+       1250 +          raise ValueError(f"Unknown sparsification method: 
+            + {method}")
+       1251 +  
+       1252 +      # Rescale to preserve L1 norm
+       1253 +      if rescale and original_norm is not None:
+       1254 +          current_norm = result.abs().sum()
+       1255 +          if current_norm > 0:
+       1256 +              result = result * (original_norm / 
+            + current_norm)
+       1257 +  
+       1258 +      return result
+       1259 +  
+       1260 +  
+       1261 +  def get_consensus_mask(
+       1262 +      deltas: torch.Tensor,
+       1263 +      method: ConsensusMethod = ConsensusMethod.SUM,
+       1264 +      dtype: Optional[torch.dtype] = None,
+       1265 +  ) -> torch.Tensor:
+       1266 +      """
+       1267 +      Get consensus mask for merging deltas.
+       1268 +  
+       1269 +      Reference: 
+            + mergekit/merge_methods/generalized_task_arithmetic.py 
+            + get_mask()
+       1270 +  
+       1271 +      Args:
+       1272 +          deltas: Stacked delta tensors [num_models, ...]
+       1273 +          method: Consensus method (COUNT or SUM)
+       1274 +          dtype: Output mask dtype
+       1275 +  
+       1276 +      Returns:
+       1277 +          Boolean mask indicating which deltas agree with 
+            + consensus
+       1278 +  
+       1279 +      Example:
+       1280 +          ```python
+       1281 +          # Stack deltas from multiple models
+       1282 +          deltas = torch.stack([delta1, delta2, delta3], 
+            + dim=0)
+       1283 +  
+       1284 +          # Get consensus mask
+       1285 +          mask = get_consensus_mask(deltas, 
+            + method=ConsensusMethod.SUM)
+       1286 +  
+       1287 +          # Apply mask
+       1288 +          merged_delta = (deltas * mask).sum(dim=0)
+       1289 +          ```
+       1290 +      """
+       1291 +      if dtype is None:
+       1292 +          dtype = deltas.dtype
+       1293 +  
+       1294 +      sign = deltas.sign().to(dtype)
+       1295 +  
+       1296 +      if method == ConsensusMethod.SUM:
+       1297 +          # TIES paper: weight by magnitude
+       1298 +          sign_weight = deltas.sum(dim=0)
+       1299 +          majority_sign = (sign_weight >= 0).to(dtype) * 2 -
+            +  1
+       1300 +      elif method == ConsensusMethod.COUNT:
+       1301 +          # Simple majority vote by count
+       1302 +          majority_sign = (sign.sum(dim=0) >= 0).to(dtype) *
+            +  2 - 1
+       1303 +      else:
+       1304 +          raise ValueError(f"Unknown consensus method: 
+            + {method}")
+       1305 +  
+       1306 +      # Return mask where each delta agrees with majority
+       1307 +      return sign == majority_sign
+       1308 +  
+       1309 +  
+       1310    class MergeStrategy(Enum):
+       1311        """모델 병합 전략"""
+       1312        SLERP = "slerp"        # Spherical Linear 
+              Interpolation
+
+● DNA Transfer updated. Now let me update the todo and proceed to the final
+  task - GatedDeltaNet:
+
+● Search(pattern: "**/gated*delta*.py", path:
+        "~/ws/llm/OLMo-core/src/olmo_core")
+  ⎿  Found 0 files 
+
+● Search(pattern: "class
+        GatedDeltaNet|use_short_conv|use_output_gate|layer_idx", path: "fla",
+        output_mode: "content")
+  ⎿  Found 20 lines (ctrl+o to expand)
+
+● Search(pattern:
+        "class.*GatedDeltaNet|GatedDeltaNetConfig|fuse_norm|chunk_size", path:
+        "fla", output_mode: "content")
+  ⎿  Found 20 lines (ctrl+o to expand)
+
+● Search(pattern: "**/*gated*delta*/**/*.py", path: "fla")
+  ⎿  Found 16 files (ctrl+o to expand)
+
+● Read(fla/fla/models/gated_deltanet/configuration_gated_deltanet.py)
+  ⎿  Read 102 lines
+
+● Read(fla/fla/models/gated_deltanet/modeling_gated_deltanet.py)
+  ⎿  Read 380 lines
+
+● Let me look at the GatedDeltaNet layer implementation:
+
+● Read(fla/fla/layers/gated_deltanet.py)
+  ⎿  Read 150 lines
+  ⎿  Limit reached · resets 10pm (Asia/Seoul) · /upgrade to Max 20x or turn on 
+     /extra-usage
+     /upgrade to increase your usage limit.
+
+
+

@@ -1,0 +1,24 @@
+
+╭─── Claude Code v2.0.59 ──────────────────────────────────────────────────────╮
+│                           │ Tips for getting started                         │
+│   Welcome back Yeo Won!   │ Run /init to create a CLAUDE.md file with instr… │
+│                           │ ──────────────────────────────────────────────── │
+│          ▐▛███▜▌          │ Recent activity                                  │
+│         ▝▜█████▛▘         │ No recent activity                               │
+│           ▘▘ ▝▝           │                                                  │
+│                           │                                                  │
+│   Opus 4.5 · Claude Max   │                                                  │
+│    ~/ws/llm/OLMo-core     │                                                  │
+╰──────────────────────────────────────────────────────────────────────────────╯
+══════════════════ Conversation compacted · ctrl+o for history ═════════════════
+  ⎿  Referenced file docs/TRIPLE_HYBRID_ARCHITECTURE.md
+  ⎿  Read src/olmo_core/nn/transformer/__init__.py (308 lines)
+  ⎿  Referenced file src/olmo_core/nn/transformer/atlas_memory.py
+  ⎿  Read ../LaDiR/vae/train_vae.py (285 lines)
+  ⎿  Read ../LaDiR/vae/data_vae.py (70 lines)
+  ⎿  Limit reached · resets 6pm (Asia/Seoul) · /upgrade to Max 20x or turn on 
+     /extra-usage
+     /upgrade to increase your usage limit.
+
+
+

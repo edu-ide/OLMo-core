@@ -1,0 +1,53 @@
+%%{init: {'theme': 'neutral', 'themeVariables': { 'fontFamily': 'Times New Roman', 'fontSize': '14px', 'primaryColor': '#fff', 'edgeLabelBackground':'#fff', 'clusterBkg': '#f9f9f9', 'clusterBorder': '#666' }}}%%
+graph TD
+    classDef default fill:#fff,stroke:#333,stroke-width:1px;
+    classDef cluster fill:#f9f9f9,stroke:#666,stroke-width:1px,rx:5,ry:5;
+    classDef highlight fill:#e6f3ff,stroke:#333,stroke-width:1px;
+    
+    subgraph GatedDeltaNet ["Gated DeltaNet Block (Qwen3-Next)"]
+        direction TB
+        Input1["Input"] --> Norm1["RMSNorm (Zero-Centered)"]
+        Norm1 --> Proj1["Linear Projections (Q, K, V, Beta)"]
+        
+        Proj1 --> Conv["Conv1D (Short Conv)"]
+        Conv --> Delta["Delta Rule SSM<br/>(v_t = v_{t-1} + beta * (K*v_{t-1} - V))"]
+        
+        Proj1 --> Gate1["Output Gate (SiLU)"]
+        Delta --> Mult1["(x)"]
+        Gate1 --> Mult1
+        
+        Mult1 --> OutProj1["Output Projection"]
+        OutProj1 --> Res1["(+)"]
+        Input1 --> Res1
+        
+        Res1 --> Norm2["RMSNorm"]
+        Norm2 --> MoE1["Ultra-Sparse MoE<br/>(Router + Experts)"]
+        MoE1 --> Res2["(+)"]
+        Res1 --> Res2
+        Res2 --> Output1["Output"]
+    end
+    
+    subgraph GatedAttention ["Gated Attention Block (Qwen3-Next)"]
+        direction TB
+        Input2["Input"] --> Norm3["RMSNorm (Zero-Centered)"]
+        Norm3 --> Proj2["Linear Projections (Q, K, V)"]
+        
+        Proj2 --> RoPE["Partial RoPE<br/>(Applied to Q, K)"]
+        RoPE --> Attn["Flash Attention<br/>(Scaled Dot Product)"]
+        
+        Proj2 --> Gate2["Output Gate (Sigmoid)"]
+        Attn --> Mult2["(x)"]
+        Gate2 --> Mult2
+        
+        Mult2 --> OutProj2["Output Projection"]
+        OutProj2 --> Res3["(+)"]
+        Input2 --> Res3
+        
+        Res3 --> Norm4["RMSNorm"]
+        Norm4 --> MoE2["Ultra-Sparse MoE<br/>(Router + Experts)"]
+        MoE2 --> Res4["(+)"]
+        Res3 --> Res4
+        Res4 --> Output2["Output"]
+    end
+    
+    linkStyle default stroke:#333,stroke-width:1px;

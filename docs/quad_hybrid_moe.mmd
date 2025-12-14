@@ -1,0 +1,54 @@
+%%{init: {'theme': 'neutral', 'themeVariables': { 'fontFamily': 'Times New Roman', 'fontSize': '14px', 'primaryColor': '#fff', 'edgeLabelBackground':'#fff', 'clusterBkg': '#f9f9f9', 'clusterBorder': '#666' }}}%%
+graph TD
+    classDef default fill:#fff,stroke:#333,stroke-width:1px;
+    classDef cluster fill:#f9f9f9,stroke:#666,stroke-width:1px,rx:5,ry:5;
+    
+    Input["Input Sequence"] --> L0
+    
+    subgraph Backbone ["Quad-Hybrid + MoE Backbone (1:3.5:3.5:2)"]
+        direction TB
+        
+        subgraph ATLAS ["Neural Long-term Memory (10%)"]
+            direction TB
+            L0["Layer 0: ATLAS + MoE<br/>(10M+ Tokens)"] 
+        end
+
+        L0 --> L1
+
+        subgraph DLM ["Deep Long-term Memory (35%)"]
+            direction TB
+            L1["Layer 1: Mamba-3 + MoE"] --> L2["Layer 2: Mamba-3 + MoE"]
+            L2 --> L3["Layer 3: Mamba-3 + MoE"]
+            L3 --> L4["Layer 4: Mamba-3 + MoE"]
+        end
+        
+        L4 --> L5
+
+        subgraph HWM ["High-speed Working Memory (35%)"]
+            direction TB
+            L5["Layer 5: Gated DeltaNet + MoE"] --> L6["Layer 6: Gated DeltaNet + MoE"]
+            L6 --> L7["Layer 7: Gated DeltaNet + MoE"]
+        end
+        
+        L7 --> L8
+
+        subgraph FA ["Focused Attention (20%)"]
+            direction TB
+            L8["Layer 8: Gated Attention + MoE"] --> L9["Layer 9: Gated Attention + MoE"]
+        end
+    end
+    
+    L9 --> Output["Output"]
+
+    subgraph MoE ["Ultra-Sparse MoE Structure (Applied to All Layers)"]
+        direction TB
+        Token["Token Input"] --> RouterNode["Router"]
+        RouterNode -->|Top-K| Routed["Routed Experts (10 / 512)"]
+        Token --> Shared["Shared Expert (1)"]
+        Routed --> AddNode["(+)"]
+        Shared --> AddNode
+        AddNode --> MoEOut["MoE Output"]
+    end
+    
+    %% Styling connections
+    linkStyle default stroke:#333,stroke-width:1px;
