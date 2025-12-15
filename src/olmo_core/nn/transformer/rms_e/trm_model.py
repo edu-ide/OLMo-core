@@ -65,6 +65,11 @@ class TRMReasoningModule(nn.Module):
             for i in range(L_layers)
         ])
 
+        # Mark layers as TRM mode to disable nested checkpointing
+        # (checkpointing is done at TRM loop level instead)
+        for layer in self.layers:
+            layer._trm_mode = True
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -187,7 +192,9 @@ class TRMStyleRMSE(nn.Module):
         shift_labels = shift_labels.view(-1)  # [B*(L-1)]
 
         total_tokens = shift_hidden.size(0)
-        total_loss = 0.0
+
+        # [FIX] Initialize total_loss as a tensor for proper gradient tracking
+        total_loss = torch.tensor(0.0, device=hidden_states.device, dtype=torch.float32)
         num_valid_tokens = 0
 
         # Process in chunks
@@ -219,7 +226,9 @@ class TRMStyleRMSE(nn.Module):
         if num_valid_tokens > 0:
             return total_loss / num_valid_tokens
         else:
-            return torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
+            # Return 0 loss with gradient tracking (should not happen in practice)
+            # Multiply by a parameter to maintain gradient flow
+            return (hidden_states.sum() * 0.0).to(torch.float32)
 
     def forward(
         self,
@@ -256,25 +265,40 @@ class TRMStyleRMSE(nn.Module):
         q_halt_logits = None
         q_continue_logits = None
 
-        # Helper for checkpointed reasoning call
+        # Helper for checkpointed reasoning call (CRITICAL for memory!)
+        # Without this, 7 reasoning calls × 2 layers = 14 full activation sets stored
         def _reasoning_step(state, injection):
             return self.reasoning(state, input_injection=injection)
 
         # TRM-style: H_cycles-1 without grad, 1 with grad
         # Following original TRM implementation exactly
 
-        # H_cycles-1 without grad
+        # H_cycles-1 without grad (no activation storage needed)
         with torch.no_grad():
             for _H_step in range(self.H_cycles - 1):
                 for _L_step in range(self.L_cycles):
                     z_L, _ = self.reasoning(z_L, input_injection=z_H + input_embeds)
                 z_H, _ = self.reasoning(z_H, input_injection=z_L)
 
-        # 1 with grad (no context manager, following original TRM)
+        # 1 with grad - USE GRADIENT CHECKPOINTING to avoid OOM
+        # This is the key fix: checkpoint each reasoning call
         for _L_step in range(self.L_cycles):
-            z_L, aux = self.reasoning(z_L, input_injection=z_H + input_embeds)
+            # Checkpoint: only store z_L, recompute activations in backward
+            z_L, aux = torch_checkpoint(
+                _reasoning_step,
+                z_L,
+                z_H + input_embeds,
+                use_reentrant=False,
+            )
             total_aux_loss += aux if aux is not None else 0.0
-        z_H, aux = self.reasoning(z_H, input_injection=z_L)
+
+        # Final H update also checkpointed
+        z_H, aux = torch_checkpoint(
+            _reasoning_step,
+            z_H,
+            z_L,
+            use_reentrant=False,
+        )
         total_aux_loss += aux if aux is not None else 0.0
 
         # ACT: Compute Q-values for halting decision (after all iterations)
@@ -292,11 +316,11 @@ class TRMStyleRMSE(nn.Module):
         logits = None
 
         if labels is not None:
-            # Apple Cut Cross-Entropy: memory efficient, works on Blackwell
-            # Used for BOTH training and validation to avoid OOM
-            shift_hidden = hidden_states[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = linear_cross_entropy(shift_hidden, self.lm_head.weight, shift_labels)
+            # Use chunked cross-entropy to avoid OOM while maintaining gradient flow
+            # This is more memory-efficient than full logits but not as efficient as CCE
+            # CCE has issues with gradient checkpointing (ZeroDivisionError in backward)
+            # Note: _chunked_cross_entropy handles shifting internally
+            loss = self._chunked_cross_entropy(hidden_states, labels)
         else:
             # Inference only (no labels): compute full logits for generation
             logits = self.lm_head(hidden_states)

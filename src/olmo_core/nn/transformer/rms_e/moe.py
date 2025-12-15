@@ -291,6 +291,8 @@ class DeepSeekMoE(nn.Module):
                         expert_out = expert_out.to(y.dtype)
                     y[mask] = expert_out
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            # Cast back to input dtype (sum() may promote bf16 to float32 for numerical stability)
+            y = y.to(identity.dtype)
             y = y.view(*orig_shape)
             if aux_loss is not None:
                 y = AddAuxiliaryLoss.apply(y, aux_loss)
