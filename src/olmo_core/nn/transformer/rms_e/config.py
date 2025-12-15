@@ -78,7 +78,7 @@ class RMSEConfig(Config):
     use_qk_norm: bool = True  # QK normalization
 
     # MLA (Multi-Head Latent Attention) Settings (DeepSeek-V3)
-    use_mla: bool = False  # Enable MLA to compress KV cache
+    use_mla: bool = True  # Enable MLA to compress KV cache
     q_lora_rank: int = 0  # 0 means no low-rank for Q (DeepSeek-V3 uses 1536 for huge models)
     kv_lora_rank: int = 512  # Low-rank dimension for KV compression
     qk_nope_head_dim: int = 128  # Non-positional Q/K dimension

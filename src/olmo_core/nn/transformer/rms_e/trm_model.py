@@ -260,59 +260,28 @@ class TRMStyleRMSE(nn.Module):
         def _reasoning_step(state, injection):
             return self.reasoning(state, input_injection=injection)
 
-        for h_step in range(self.H_cycles):
-            is_last_step = (h_step == self.H_cycles - 1)
+        # TRM-style: H_cycles-1 without grad, 1 with grad
+        # Following original TRM implementation exactly
 
-            # Gradient truncation: only compute grad for last step
-            context = torch.no_grad() if not is_last_step else torch.enable_grad()
+        # H_cycles-1 without grad
+        with torch.no_grad():
+            for _H_step in range(self.H_cycles - 1):
+                for _L_step in range(self.L_cycles):
+                    z_L, _ = self.reasoning(z_L, input_injection=z_H + input_embeds)
+                z_H, _ = self.reasoning(z_H, input_injection=z_L)
 
-            with context:
-                # Inner loop: Update z_L multiple times
-                for l_step in range(self.L_cycles):
-                    injection = z_H + input_embeds
-                    if is_last_step and self.training:
-                        # Use gradient checkpointing to save memory
-                        z_L, aux = torch_checkpoint(
-                            _reasoning_step, z_L, injection,
-                            use_reentrant=False
-                        )
-                    else:
-                        z_L, aux = self.reasoning(z_L, input_injection=injection)
-                    if is_last_step:
-                        total_aux_loss += aux if aux is not None else 0.0
+        # 1 with grad (no context manager, following original TRM)
+        for _L_step in range(self.L_cycles):
+            z_L, aux = self.reasoning(z_L, input_injection=z_H + input_embeds)
+            total_aux_loss += aux if aux is not None else 0.0
+        z_H, aux = self.reasoning(z_H, input_injection=z_L)
+        total_aux_loss += aux if aux is not None else 0.0
 
-                # Outer loop: Update z_H once using z_L
-                if is_last_step and self.training:
-                    z_H, aux = torch_checkpoint(
-                        _reasoning_step, z_H, z_L,
-                        use_reentrant=False
-                    )
-                else:
-                    z_H, aux = self.reasoning(z_H, input_injection=z_L)
-                if is_last_step:
-                    total_aux_loss += aux if aux is not None else 0.0
-
-            # ACT: Compute Q-values for halting decision
-            if self.use_act:
-                # Use first token position for halting decision (like TRM)
-                q_logits = self.q_head(z_H[:, 0]).float()  # [B, 2]
-                q_halt_logits = q_logits[:, 0]
-                q_continue_logits = q_logits[:, 1]
-
-                # During inference: early exit if q_halt > q_continue
-                if not self.training and h_step < self.H_cycles - 1:
-                    if (q_halt_logits > q_continue_logits).all():
-                        halt_step = h_step + 1
-                        break
-
-                # During training: exploration (random early exit for Q-learning)
-                if self.training and h_step < self.H_cycles - 1:
-                    if random.random() < self.act_exploration_prob:
-                        # Random exploration: might halt early
-                        min_steps = random.randint(1, self.H_cycles)
-                        if h_step + 1 >= min_steps and (q_halt_logits > q_continue_logits).any():
-                            halt_step = h_step + 1
-                            break
+        # ACT: Compute Q-values for halting decision (after all iterations)
+        if self.use_act:
+            q_logits = self.q_head(z_H[:, 0]).float()  # [B, 2]
+            q_halt_logits = q_logits[:, 0]
+            q_continue_logits = q_logits[:, 1]
 
         # Output from z_H (high-level state)
         hidden_states = self.norm(z_H)
@@ -322,22 +291,15 @@ class TRMStyleRMSE(nn.Module):
         loss = None
         logits = None
 
-        if labels is not None and self.training:
+        if labels is not None:
             # Apple Cut Cross-Entropy: memory efficient, works on Blackwell
+            # Used for BOTH training and validation to avoid OOM
             shift_hidden = hidden_states[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = linear_cross_entropy(shift_hidden, self.lm_head.weight, shift_labels)
         else:
-            # Inference or no labels: compute full logits
+            # Inference only (no labels): compute full logits for generation
             logits = self.lm_head(hidden_states)
-            if labels is not None:
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous()
-                loss = F.cross_entropy(
-                    shift_logits.view(-1, self.config.vocab_size),
-                    shift_labels.view(-1),
-                    ignore_index=-100
-                )
 
         return {
             "logits": logits,

@@ -23,17 +23,34 @@ from .moe import DeepSeekMoE, DenseFFN
 from .attention import GatedSWA
 from .hsa_ultralong import HSAUltraLongBlock
 
-# Import FLA's GatedDeltaNet
+# Import NVlabs GatedDeltaNet (official implementation with proper gradient flow)
+# Reference: https://github.com/NVlabs/GatedDeltaNet
+import sys
+import os
+_nvlabs_path = os.path.join(os.path.dirname(__file__), '..', '..', '..', '..', '..', '..', 'refs', 'GatedDeltaNet')
+if os.path.exists(_nvlabs_path):
+    sys.path.insert(0, _nvlabs_path)
+
+try:
+    from lit_gpt.gated_delta_net import GatedDeltaNet as NVLabsGatedDeltaNet
+    NVLABS_DELTANET_AVAILABLE = True
+    print("[GatedDeltaNet] Using NVlabs official implementation (proper gradient flow)")
+except ImportError:
+    NVLABS_DELTANET_AVAILABLE = False
+    print("[GatedDeltaNet] NVlabs not available, falling back to FLA")
+
+# Fallback to FLA if NVlabs not available
 try:
     from fla.layers import GatedDeltaNet as FLAGatedDeltaNet
     FLA_AVAILABLE = True
 except ImportError:
     FLA_AVAILABLE = False
-    raise ImportError(
-        "FLA (Flash Linear Attention) is REQUIRED.\n"
-        "Install: pip install flash-linear-attention\n"
-        "Reference: https://github.com/NVlabs/GatedDeltaNet"
-    )
+    if not NVLABS_DELTANET_AVAILABLE:
+        raise ImportError(
+            "Neither NVlabs GatedDeltaNet nor FLA is available.\n"
+            "Clone NVlabs: git clone https://github.com/NVlabs/GatedDeltaNet refs/GatedDeltaNet\n"
+            "Or install FLA: pip install flash-linear-attention"
+        )
 
 
 class RMSEDecoderLayer(nn.Module):
@@ -97,13 +114,27 @@ class RMSEDecoderLayer(nn.Module):
 
         # ===== 3. GatedDeltaNet (EVERY layer, THIRD/ALWAYS) =====
         self.deltanet_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.deltanet = FLAGatedDeltaNet(
-            hidden_size=config.hidden_size,
-            num_heads=config.deltanet_num_heads,
-            head_dim=config.deltanet_head_dim,
-            expand_v=config.deltanet_expand_v,
-            mode='chunk',
-        )
+
+        # Use NVlabs official implementation (proper gradient flow) if available
+        if NVLABS_DELTANET_AVAILABLE:
+            self.deltanet = NVLabsGatedDeltaNet(
+                hidden_size=config.hidden_size,
+                num_heads=config.deltanet_num_heads,
+                expand_k=0.75,  # NVlabs default
+                expand_v=config.deltanet_expand_v,
+                mode='chunk',
+                layer_idx=layer_idx,
+            )
+            self._use_nvlabs_deltanet = True
+        else:
+            self.deltanet = FLAGatedDeltaNet(
+                hidden_size=config.hidden_size,
+                num_heads=config.deltanet_num_heads,
+                head_dim=config.deltanet_head_dim,
+                expand_v=config.deltanet_expand_v,
+                mode='chunk',
+            )
+            self._use_nvlabs_deltanet = False
 
         # ===== 4. FFN: MoE or Dense (EVERY layer) =====
         self.moe_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -133,6 +164,7 @@ class RMSEDecoderLayer(nn.Module):
         # Gradient checkpointing (disabled by default)
         self.gradient_checkpointing = False
 
+    @torch.compiler.disable  # HSA uses complex tensor ops incompatible with inductor
     def _forward_impl(
         self,
         hidden_states: torch.Tensor,
@@ -142,6 +174,7 @@ class RMSEDecoderLayer(nn.Module):
         total_aux_loss = torch.tensor(0.0, device=hidden_states.device, dtype=hidden_states.dtype)
 
         # ===== 1. HSA-UltraLong (global sparse attention) =====
+        # Official Impl: NSA -> SWA -> SSM
         if self.hsa is not None:
             hidden_states, _ = self.hsa(hidden_states)
 
@@ -152,7 +185,7 @@ class RMSEDecoderLayer(nn.Module):
             hidden_states = self.swa(hidden_states)
             hidden_states = residual + hidden_states
 
-        # ===== 3. GatedDeltaNet (linear attention) =====
+        # ===== 3. GatedDeltaNet (Linear Attention / SSM) =====
         residual = hidden_states
         hidden_states = self.deltanet_norm(hidden_states)
         deltanet_output = self.deltanet(hidden_states)
@@ -170,6 +203,7 @@ class RMSEDecoderLayer(nn.Module):
 
         return hidden_states, total_aux_loss
 
+    @torch.compiler.disable  # HSA uses complex tensor ops incompatible with inductor
     def forward(
         self,
         hidden_states: torch.Tensor,
