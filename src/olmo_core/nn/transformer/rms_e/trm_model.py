@@ -280,6 +280,11 @@ class TRMStyleRMSE(nn.Module):
                     z_L, _ = self.reasoning(z_L, input_injection=z_H + input_embeds)
                 z_H, _ = self.reasoning(z_H, input_injection=z_L)
 
+        # [FIX] Re-enable gradients on state tensors after no_grad warmup
+        # Without this, gradients can't flow back through reasoning layers
+        z_H = z_H.detach().requires_grad_(True)
+        z_L = z_L.detach().requires_grad_(True)
+
         # 1 with grad - USE GRADIENT CHECKPOINTING to avoid OOM
         # This is the key fix: checkpoint each reasoning call
         for _L_step in range(self.L_cycles):
